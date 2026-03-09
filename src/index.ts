@@ -1,0 +1,25 @@
+// Public API barrel exports
+export { AtelierMcpServer } from "./server/server.js";
+export type { AtelierServerOptions } from "./server/server.js";
+export { ToolRegistry } from "./tools/tool-registry.js";
+export type { ToolDefinition } from "./tools/tool-registry.js";
+export { EventBus } from "./server/event-bus.js";
+export { BrowserBridge } from "./bridge/browser-bridge.js";
+export { SceneEngine } from "./engine/scene-engine.js";
+export type { SceneObject } from "./engine/scene-engine.js";
+export { PaletteRegistry } from "./engine/palette-registry.js";
+export type { Palette } from "./engine/palette-registry.js";
+export { SHIPPED_PALETTES, PICO8, ENDESGA32, RESURRECT64 } from "./engine/shipped-palettes.js";
+export { makeTextResponse, makeImageResponse } from "./tools/response.js";
+export { AtelierError, ErrorCode } from "./types/errors.js";
+export type { EventMap, EventName } from "./types/events.js";
+export { defineTool } from "./plugins/define-tool.js";
+export { PluginLoader } from "./plugins/plugin-loader.js";
+export type { AtelierContext, PluginToolDefinition } from "./plugins/define-tool.js";
+export { CommandHistory } from "./engine/command-history.js";
+export type { CommandRecord } from "./engine/command-history.js";
+export { captureSession, restoreSession } from "./engine/session.js";
+export type { SessionData } from "./engine/session.js";
+export { ShaderRegistry } from "./engine/shader-registry.js";
+export { SkeletonRegistry } from "./animation/skeleton.js";
+export { AnimationClipRegistry } from "./animation/animation-clip.js";
