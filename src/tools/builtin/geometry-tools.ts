@@ -180,15 +180,18 @@ export function registerGeometryTools(server: AtelierMcpServer): void {
   server.registry.register({
     name: "deform",
     description:
-      "Apply a deformation to an existing mesh. Currently supports 'noise' type " +
-      "(displaces vertices by random noise). bend/twist/taper are stubs.",
+      "Apply a deformation to an existing mesh. Types: 'noise' (random displacement), " +
+      "'bend' (curve along axis), 'twist' (rotate along axis), 'taper' (scale along axis).",
     schema: {
       objectId: z.string().describe("ID of the mesh to deform"),
       type: z.enum(["bend", "twist", "taper", "noise"]).describe("Deformation type"),
       params: z
         .record(z.number())
         .optional()
-        .describe("Deformation params — e.g. { amplitude: 0.2, seed: 42 } for noise"),
+        .describe(
+          "Deformation params — noise: { amplitude, seed }; bend: { angle (radians), axis }; " +
+            "twist: { angle (radians), axis }; taper: { factor (0-1), axis }",
+        ),
     },
     handler: async (ctx) => {
       const { objectId, type, params } = ctx.args;
@@ -200,6 +203,45 @@ export function registerGeometryTools(server: AtelierMcpServer): void {
       return makeTextResponse({
         objectId,
         deformType: type,
+        ...(result as object),
+      });
+    },
+  });
+
+  // --- subdivide ---
+  server.registry.register({
+    name: "subdivide",
+    description:
+      "Apply Loop subdivision to smooth a mesh. Each level quadruples the face count. " +
+      "Use 1-2 levels for subtle smoothing, 3-4 for very smooth results.",
+    schema: {
+      objectId: z.string().describe("ID of the mesh to subdivide"),
+      levels: z
+        .number()
+        .int()
+        .min(1)
+        .max(4)
+        .default(1)
+        .describe("Subdivision levels (1-4). Each level 4x face count."),
+      preserveEdges: z
+        .boolean()
+        .default(false)
+        .describe("If true, keeps sharp edges instead of smoothing"),
+    },
+    handler: async (ctx) => {
+      const { objectId, levels, preserveEdges } = ctx.args;
+      const obj = server.scene.get(objectId);
+      if (!obj) {
+        throw new AtelierError(ErrorCode.OBJECT_NOT_FOUND, `Object "${objectId}" not found`);
+      }
+      const result = await server.bridge.execute("subdivide", {
+        objectId,
+        levels,
+        preserveEdges,
+      });
+      return makeTextResponse({
+        objectId,
+        levels,
         ...(result as object),
       });
     },

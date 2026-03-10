@@ -184,4 +184,29 @@ export function registerSceneTools(server: AtelierMcpServer): void {
       return makeTextResponse({ cleared: true });
     },
   });
+
+  // --- set_background ---
+  server.registry.register({
+    name: "set_background",
+    description:
+      "Set the scene background color and opacity. Use color '#000000' for black, " +
+      "'#ffffff' for white. Set alpha to 0 for transparent background (useful for PNG export).",
+    schema: {
+      color: z
+        .union([z.string(), z.number().int()])
+        .optional()
+        .describe("Background color as hex string ('#ff0000') or integer. Default white."),
+      alpha: z
+        .number()
+        .min(0)
+        .max(1)
+        .optional()
+        .describe("Background opacity (0=transparent, 1=opaque). Default 1."),
+    },
+    handler: async (ctx) => {
+      const { color, alpha } = ctx.args;
+      await server.bridge.execute("setBackground", { color, alpha });
+      return makeTextResponse({ color, alpha, status: "applied" });
+    },
+  });
 }

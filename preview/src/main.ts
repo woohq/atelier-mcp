@@ -18,7 +18,9 @@ const isHeadless = new URLSearchParams(location.search).get("mode") === "headles
 
 renderer.setSize(1024, 1024);
 renderer.setPixelRatio(1);
-renderer.setClearColor(0xffffff);
+let currentBgColor = 0xffffff;
+let currentBgAlpha = 1;
+renderer.setClearColor(currentBgColor, currentBgAlpha);
 document.body.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
@@ -48,7 +50,11 @@ const grid = new THREE.GridHelper(10, 10, 0x444444, 0x333333);
 scene.add(grid);
 
 // --- Post-Processing Setup ---
-const composer = new EffectComposer(renderer);
+const composerTarget = new THREE.WebGLRenderTarget(1024, 1024, {
+  format: THREE.RGBAFormat,
+  type: THREE.HalfFloatType,
+});
+const composer = new EffectComposer(renderer, composerTarget);
 const renderPass = new RenderPass(scene, camera);
 composer.addPass(renderPass);
 
@@ -355,6 +361,8 @@ function buildPostProcessShader(type: string, params: Record<string, any>): any 
           tDiffuse: { value: null },
           resolution: { value: currentResolution.clone() },
           thickness: { value: params.thickness ?? 1.0 },
+          threshold: { value: params.threshold ?? 0.1 },
+          sensitivity: { value: params.sensitivity ?? 1.0 },
           outlineColor: {
             value: new THREE.Vector3(...(params.color ?? [0, 0, 0])),
           },
@@ -364,6 +372,8 @@ function buildPostProcessShader(type: string, params: Record<string, any>): any 
           "uniform sampler2D tDiffuse;",
           "uniform vec2 resolution;",
           "uniform float thickness;",
+          "uniform float threshold;",
+          "uniform float sensitivity;",
           "uniform vec3 outlineColor;",
           "varying vec2 vUv;",
           "",
@@ -384,8 +394,9 @@ function buildPostProcessShader(type: string, params: Record<string, any>): any 
           "  float gx = tl + 2.0*l + bl - tr - 2.0*r - br;",
           "  float gy = tl + 2.0*t + tr - bl - 2.0*b - br;",
           "  float edge = sqrt(gx*gx + gy*gy);",
+          "  float edgeMask = smoothstep(threshold * 0.5, threshold, edge * sensitivity);",
           "  vec4 color = texture2D(tDiffuse, vUv);",
-          "  color.rgb = mix(color.rgb, outlineColor, clamp(edge, 0.0, 1.0));",
+          "  color.rgb = mix(color.rgb, outlineColor, edgeMask);",
           "  gl_FragColor = color;",
           "}",
         ].join("\n"),
@@ -750,18 +761,213 @@ const commands: Record<string, CommandHandler> = {
         geometry.computeVertexNormals();
         return { objectId: params.objectId, type: "noise", verticesModified: posAttr.count };
       }
-      case "bend":
-      case "twist":
-      case "taper":
-        return {
-          objectId: params.objectId,
-          type: params.type,
-          status: "not_yet_implemented",
-          message: `Deform type "${params.type}" is a stub.`,
-        };
+      case "bend": {
+        const angle = deformParams.angle ?? Math.PI / 4;
+        const axis = (deformParams.axis as string) ?? "y";
+        geometry.computeBoundingBox();
+        const bb = geometry.boundingBox!;
+        const axisIdx = axis === "x" ? 0 : axis === "y" ? 1 : 2;
+        const minVal = axisIdx === 0 ? bb.min.x : axisIdx === 1 ? bb.min.y : bb.min.z;
+        const maxVal = axisIdx === 0 ? bb.max.x : axisIdx === 1 ? bb.max.y : bb.max.z;
+        const range = maxVal - minVal;
+        if (range < 0.0001) break;
+
+        for (let i = 0; i < posAttr.count; i++) {
+          const pos = [posAttr.getX(i), posAttr.getY(i), posAttr.getZ(i)];
+          const t = (pos[axisIdx] - minVal) / range;
+          const bendAngle = angle * t;
+
+          const [p1] = axisIdx === 0 ? [1, 2] : axisIdx === 1 ? [0, 2] : [0, 1];
+
+          const cos = Math.cos(bendAngle);
+          const sin = Math.sin(bendAngle);
+          const origP1 = pos[p1];
+          const origAxis = pos[axisIdx];
+          pos[p1] = origP1 * cos - origAxis * sin;
+          pos[axisIdx] = origP1 * sin + origAxis * cos;
+
+          posAttr.setXYZ(i, pos[0], pos[1], pos[2]);
+        }
+        posAttr.needsUpdate = true;
+        geometry.computeVertexNormals();
+        return { objectId: params.objectId, type: "bend", verticesModified: posAttr.count };
+      }
+      case "twist": {
+        const angle = deformParams.angle ?? Math.PI / 2;
+        const axis = (deformParams.axis as string) ?? "y";
+        geometry.computeBoundingBox();
+        const bb = geometry.boundingBox!;
+        const axisIdx = axis === "x" ? 0 : axis === "y" ? 1 : 2;
+        const minVal = axisIdx === 0 ? bb.min.x : axisIdx === 1 ? bb.min.y : bb.min.z;
+        const maxVal = axisIdx === 0 ? bb.max.x : axisIdx === 1 ? bb.max.y : bb.max.z;
+        const range = maxVal - minVal;
+        if (range < 0.0001) break;
+
+        const [p1, p2] = axisIdx === 0 ? [1, 2] : axisIdx === 1 ? [0, 2] : [0, 1];
+
+        for (let i = 0; i < posAttr.count; i++) {
+          const pos = [posAttr.getX(i), posAttr.getY(i), posAttr.getZ(i)];
+          const t = (pos[axisIdx] - minVal) / range;
+          const twistAngle = angle * t;
+          const cos = Math.cos(twistAngle);
+          const sin = Math.sin(twistAngle);
+          const origP1 = pos[p1];
+          const origP2 = pos[p2];
+          pos[p1] = origP1 * cos - origP2 * sin;
+          pos[p2] = origP1 * sin + origP2 * cos;
+          posAttr.setXYZ(i, pos[0], pos[1], pos[2]);
+        }
+        posAttr.needsUpdate = true;
+        geometry.computeVertexNormals();
+        return { objectId: params.objectId, type: "twist", verticesModified: posAttr.count };
+      }
+      case "taper": {
+        const factor = deformParams.factor ?? 0.5;
+        const axis = (deformParams.axis as string) ?? "y";
+        geometry.computeBoundingBox();
+        const bb = geometry.boundingBox!;
+        const axisIdx = axis === "x" ? 0 : axis === "y" ? 1 : 2;
+        const minVal = axisIdx === 0 ? bb.min.x : axisIdx === 1 ? bb.min.y : bb.min.z;
+        const maxVal = axisIdx === 0 ? bb.max.x : axisIdx === 1 ? bb.max.y : bb.max.z;
+        const range = maxVal - minVal;
+        if (range < 0.0001) break;
+
+        const [p1, p2] = axisIdx === 0 ? [1, 2] : axisIdx === 1 ? [0, 2] : [0, 1];
+
+        for (let i = 0; i < posAttr.count; i++) {
+          const pos = [posAttr.getX(i), posAttr.getY(i), posAttr.getZ(i)];
+          const t = (pos[axisIdx] - minVal) / range;
+          const scale = 1 + (factor - 1) * t;
+          pos[p1] *= scale;
+          pos[p2] *= scale;
+          posAttr.setXYZ(i, pos[0], pos[1], pos[2]);
+        }
+        posAttr.needsUpdate = true;
+        geometry.computeVertexNormals();
+        return { objectId: params.objectId, type: "taper", verticesModified: posAttr.count };
+      }
       default:
         throw new Error(`Unknown deform type: ${params.type}`);
     }
+  },
+
+  subdivide(params) {
+    const obj = objects.get(params.objectId);
+    if (!obj || !(obj instanceof THREE.Mesh)) throw new Error("Mesh not found");
+
+    let geometry = obj.geometry;
+    const levels = Math.min(params.levels ?? 1, 4);
+
+    for (let level = 0; level < levels; level++) {
+      // Ensure we have an indexed geometry
+      if (!geometry.index) {
+        const posAttr = geometry.getAttribute("position");
+        const indices: number[] = [];
+        for (let i = 0; i < posAttr.count; i++) indices.push(i);
+        geometry.setIndex(indices);
+      }
+
+      const posAttr = geometry.getAttribute("position");
+      const index = geometry.index!;
+      const positions: number[] = [];
+
+      // Copy existing positions
+      for (let i = 0; i < posAttr.count; i++) {
+        positions.push(posAttr.getX(i), posAttr.getY(i), posAttr.getZ(i));
+      }
+
+      // Edge map: "min_max" -> { midIndex }
+      const edgeMap = new Map<string, { midIdx: number; v0: number; v1: number }>();
+      const newIndices: number[] = [];
+
+      function getEdgeMid(a: number, b: number): number {
+        const key = Math.min(a, b) + "_" + Math.max(a, b);
+        if (edgeMap.has(key)) return edgeMap.get(key)!.midIdx;
+
+        const midIdx = positions.length / 3;
+        const ax = positions[a * 3],
+          ay = positions[a * 3 + 1],
+          az = positions[a * 3 + 2];
+        const bx = positions[b * 3],
+          by = positions[b * 3 + 1],
+          bz = positions[b * 3 + 2];
+        positions.push((ax + bx) / 2, (ay + by) / 2, (az + bz) / 2);
+        edgeMap.set(key, { midIdx, v0: a, v1: b });
+        return midIdx;
+      }
+
+      // For each triangle, split into 4
+      const triCount = index.count / 3;
+      for (let t = 0; t < triCount; t++) {
+        const i0 = index.getX(t * 3);
+        const i1 = index.getX(t * 3 + 1);
+        const i2 = index.getX(t * 3 + 2);
+
+        const m01 = getEdgeMid(i0, i1);
+        const m12 = getEdgeMid(i1, i2);
+        const m20 = getEdgeMid(i2, i0);
+
+        // 4 new triangles
+        newIndices.push(i0, m01, m20);
+        newIndices.push(m01, i1, m12);
+        newIndices.push(m20, m12, i2);
+        newIndices.push(m01, m12, m20);
+      }
+
+      // If not preserving edges, apply smoothing to original vertices
+      if (!params.preserveEdges) {
+        const vertCount = posAttr.count;
+        const neighbors: Set<number>[] = Array.from({ length: vertCount }, () => new Set());
+        for (let t = 0; t < triCount; t++) {
+          const i0 = index.getX(t * 3);
+          const i1 = index.getX(t * 3 + 1);
+          const i2 = index.getX(t * 3 + 2);
+          neighbors[i0].add(i1);
+          neighbors[i0].add(i2);
+          neighbors[i1].add(i0);
+          neighbors[i1].add(i2);
+          neighbors[i2].add(i0);
+          neighbors[i2].add(i1);
+        }
+
+        for (let v = 0; v < vertCount; v++) {
+          const n = neighbors[v].size;
+          if (n < 2) continue;
+          const beta = n > 3 ? 3 / (8 * n) : 3 / 16;
+          let sx = 0,
+            sy = 0,
+            sz = 0;
+          for (const nb of neighbors[v]) {
+            sx += positions[nb * 3];
+            sy += positions[nb * 3 + 1];
+            sz += positions[nb * 3 + 2];
+          }
+          const ox = posAttr.getX(v),
+            oy = posAttr.getY(v),
+            oz = posAttr.getZ(v);
+          positions[v * 3] = (1 - n * beta) * ox + beta * sx;
+          positions[v * 3 + 1] = (1 - n * beta) * oy + beta * sy;
+          positions[v * 3 + 2] = (1 - n * beta) * oz + beta * sz;
+        }
+      }
+
+      // Build new geometry
+      const newGeo = new THREE.BufferGeometry();
+      newGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(positions), 3));
+      newGeo.setIndex(newIndices);
+      newGeo.computeVertexNormals();
+
+      geometry.dispose();
+      geometry = newGeo;
+    }
+
+    obj.geometry = geometry;
+    return {
+      objectId: params.objectId,
+      levels,
+      vertexCount: geometry.getAttribute("position").count,
+      faceCount: geometry.index ? geometry.index.count / 3 : 0,
+    };
   },
 
   removeObject(params) {
@@ -789,6 +995,15 @@ const commands: Record<string, CommandHandler> = {
       objects.delete(id);
     }
     return { ok: true };
+  },
+
+  setBackground(params) {
+    const color = params.color ?? 0xffffff;
+    const alpha = params.alpha ?? 1;
+    currentBgColor = typeof color === "string" ? new THREE.Color(color).getHex() : color;
+    currentBgAlpha = alpha;
+    renderer.setClearColor(currentBgColor, currentBgAlpha);
+    return { color: currentBgColor, alpha: currentBgAlpha };
   },
 
   listObjects() {
@@ -1834,16 +2049,15 @@ const commands: Record<string, CommandHandler> = {
     const quality: number = params.quality ?? 0.92;
 
     if (transparent) {
-      renderer.setClearColor(0x000000, 0);
+      renderer.setClearColor(0xffffff, 0);
     } else {
-      renderer.setClearColor(0xffffff, 1);
+      renderer.setClearColor(currentBgColor, currentBgAlpha);
     }
 
     composer.render();
 
-    if (transparent) {
-      renderer.setClearColor(0xffffff, 1);
-    }
+    // Restore background
+    renderer.setClearColor(currentBgColor, currentBgAlpha);
 
     if (format === "jpeg") {
       return renderer.domElement.toDataURL("image/jpeg", quality / 100).split(",")[1];

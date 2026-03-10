@@ -22,7 +22,7 @@ export function registerShaderTools(server: AtelierMcpServer): void {
           "Effect parameters. pixelate: { pixelSize: number }. cel_shade: { steps: number }. " +
             "dither: { strength: number, matrixSize: number }. " +
             "palette_quantize: { palette: number[][], paletteSize: number }. " +
-            "outline: { thickness: number, color: [r,g,b] (0-1 floats) }.",
+            "outline: { thickness: number, color: [r,g,b] (0-1 floats), threshold: number (0-1, default 0.1), sensitivity: number (default 1.0) }.",
         ),
     },
     handler: async (ctx) => {
