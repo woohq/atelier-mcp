@@ -4,9 +4,11 @@ import { registerAnimationTools } from "./animation-tools.js";
 import { registerCanvasTools } from "./canvas-tools.js";
 import { registerExportTools } from "./export-tools.js";
 import { registerImportTools } from "./import-tools.js";
+import { registerLibraryTools } from "./library-tools.js";
 import { registerGeometryTools } from "./geometry-tools.js";
 import { registerMaterialTools } from "./material-tools.js";
 import { registerModelingTools } from "./modeling-tools.js";
+import { registerParticleTools } from "./particle-tools.js";
 import { registerProceduralTools } from "./procedural-tools.js";
 import { registerRenderPreview } from "./render-preview.js";
 import { registerSceneTools } from "./scene-tools.js";
@@ -31,4 +33,6 @@ export function registerBuiltinTools(server: AtelierMcpServer): void {
   registerStyleTools(server);
   registerVariationTools(server);
   registerImportTools(server);
+  registerParticleTools(server);
+  registerLibraryTools(server);
 }

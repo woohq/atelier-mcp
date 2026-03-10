@@ -23,6 +23,8 @@ import { StylePresetRegistry } from "../styles/style-preset-registry.js";
 import { SeededRNG } from "../util/rng.js";
 import { logger } from "../util/logger.js";
 import { registerBuiltinTools } from "../tools/builtin/index.js";
+import { createUndoMiddleware } from "./undo-middleware.js";
+import { installSymmetryMiddleware } from "./symmetry-middleware.js";
 
 export interface AtelierServerOptions {
   previewUrl?: string;
@@ -125,12 +127,16 @@ export class AtelierMcpServer {
     // Register built-in tools
     registerBuiltinTools(this);
 
+    // Install symmetry middleware (wraps bridge.execute for auto-mirroring)
+    installSymmetryMiddleware(this);
+
     // Wire tools to MCP with middleware
     const middlewares = [
       loggingMiddleware,
       timingMiddleware,
       createTimeoutMiddleware(options.toolTimeoutMs),
       createErrorHandlingMiddleware(),
+      createUndoMiddleware(this),
     ];
 
     this.registry.wireToMcp(this.mcp, (handler: ToolHandler) =>

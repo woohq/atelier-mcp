@@ -11,10 +11,23 @@ function atelierRelay(): Plugin {
   return {
     name: "atelier-relay",
     configureServer(server) {
+      const commandLog: Array<{ command: string; params: any }> = [];
+
       server.ws.on("atelier:command", (data) => {
+        if (data.command === "clearScene") {
+          commandLog.length = 0;
+        }
+        commandLog.push(data);
         // Broadcast to ALL clients. The headless browser ignores relayed
         // commands (isHeadless check on client side), so no feedback loop.
         server.ws.send("atelier:command", data);
+      });
+
+      server.ws.on("atelier:sync-request", (_data, client) => {
+        // Send accumulated commands to the requesting client
+        for (const entry of commandLog) {
+          client.send("atelier:command", entry);
+        }
       });
     },
   };

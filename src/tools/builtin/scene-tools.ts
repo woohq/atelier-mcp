@@ -296,6 +296,31 @@ export function registerSceneTools(server: AtelierMcpServer): void {
     },
   });
 
+  // --- set_symmetry ---
+  server.registry.register({
+    name: "set_symmetry",
+    description:
+      "Toggle symmetry mode. When enabled, geometry-creating tools (create_primitive, " +
+      "create_mesh, extrude, extrude_along_path) automatically create a mirrored copy " +
+      "across the specified axis.",
+    schema: {
+      enabled: z.boolean().describe("Enable or disable symmetry"),
+      axis: z
+        .enum(["x", "y", "z"])
+        .default("x")
+        .describe("Mirror axis"),
+      offset: z
+        .number()
+        .default(0)
+        .describe("Offset from origin on the mirror axis"),
+    },
+    handler: async (ctx) => {
+      const { enabled, axis, offset } = ctx.args;
+      (server as any).symmetry.set({ enabled, axis, offset });
+      return makeTextResponse({ enabled, axis, offset });
+    },
+  });
+
   // --- render_multi_view ---
   server.registry.register({
     name: "render_multi_view",

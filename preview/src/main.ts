@@ -117,6 +117,18 @@ const mixers = new Map<string, THREE.AnimationMixer>();
 // Animation clip registry — maps clipId to THREE.AnimationClip
 const clipStore = new Map<string, THREE.AnimationClip>();
 
+// Particle emitter registry
+const emitters = new Map<
+  string,
+  {
+    points: THREE.Points;
+    velocities: Float32Array;
+    lifetimes: Float32Array;
+    ages: Float32Array;
+    params: Record<string, any>;
+  }
+>();
+
 // Clock for mixer updates
 const clock = new THREE.Clock();
 
@@ -187,6 +199,35 @@ function animate() {
   for (const mixer of mixers.values()) {
     mixer.update(delta);
   }
+  // Update particle emitters
+  for (const [, emitter] of emitters) {
+    const positions = emitter.points.geometry.getAttribute("position");
+    const count = emitter.params.count ?? 100;
+    const lifetime = emitter.params.lifetime ?? 2;
+    const gravity = emitter.params.gravity ?? -0.5;
+    const speed = emitter.params.speed ?? 1;
+
+    for (let i = 0; i < count; i++) {
+      emitter.ages[i] += delta;
+      if (emitter.ages[i] >= lifetime) {
+        // Reset particle
+        emitter.ages[i] = 0;
+        positions.setXYZ(i, 0, 0, 0);
+        const spread = emitter.params.spread ?? 0.5;
+        emitter.velocities[i * 3] = (Math.random() - 0.5) * spread * speed;
+        emitter.velocities[i * 3 + 1] = Math.random() * speed;
+        emitter.velocities[i * 3 + 2] = (Math.random() - 0.5) * spread * speed;
+      }
+      // Update position
+      positions.setX(i, positions.getX(i) + emitter.velocities[i * 3] * delta);
+      positions.setY(i, positions.getY(i) + emitter.velocities[i * 3 + 1] * delta);
+      positions.setZ(i, positions.getZ(i) + emitter.velocities[i * 3 + 2] * delta);
+      // Apply gravity
+      emitter.velocities[i * 3 + 1] += gravity * delta;
+    }
+    positions.needsUpdate = true;
+  }
+
   // Update time uniform on any shader passes that use it (e.g. film_grain)
   for (const pass of effectPasses.values()) {
     if (pass.uniforms["time"]) {
@@ -2136,11 +2177,64 @@ const commands: Record<string, CommandHandler> = {
     return { objectId: params.objectId, verticesAffected: affected.length };
   },
 
+  createEmitter(params) {
+    const count = params.count ?? 100;
+    const geometry = new THREE.BufferGeometry();
+    const positions = new Float32Array(count * 3);
+    geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+
+    const startColor = params.colorStart ?? 0xffaa00;
+    const material = new THREE.PointsMaterial({
+      color: startColor,
+      size: params.size ?? 0.05,
+      sizeAttenuation: true,
+      transparent: true,
+      opacity: 0.8,
+    });
+
+    const points = new THREE.Points(geometry, material);
+    points.name = params.id;
+    if (params.position) {
+      points.position.set(params.position[0], params.position[1], params.position[2]);
+    }
+    scene.add(points);
+    objects.set(params.id, points);
+
+    emitters.set(params.id, {
+      points,
+      velocities: new Float32Array(count * 3),
+      lifetimes: new Float32Array(count).fill(params.lifetime ?? 2),
+      ages: new Float32Array(count)
+        .fill(0)
+        .map(() => Math.random() * (params.lifetime ?? 2)),
+      params,
+    });
+
+    return { id: params.id, count };
+  },
+
+  setEmitterParam(params) {
+    const emitter = emitters.get(params.emitterId);
+    if (!emitter) throw new Error(`Emitter "${params.emitterId}" not found`);
+    Object.assign(emitter.params, params.updates);
+
+    // Update material if color/size changed
+    if (params.updates.colorStart !== undefined) {
+      (emitter.points.material as THREE.PointsMaterial).color.set(params.updates.colorStart);
+    }
+    if (params.updates.size !== undefined) {
+      (emitter.points.material as THREE.PointsMaterial).size = params.updates.size;
+    }
+
+    return { emitterId: params.emitterId, updated: Object.keys(params.updates) };
+  },
+
   removeObject(params) {
     const obj = objects.get(params.objectId);
     if (!obj) throw new Error(`Object "${params.objectId}" not found`);
     obj.removeFromParent();
     objects.delete(params.objectId);
+    emitters.delete(params.objectId);
 
     // Dispose geometry/material if mesh
     if (obj instanceof THREE.Mesh) {
@@ -2160,6 +2254,7 @@ const commands: Record<string, CommandHandler> = {
       }
       objects.delete(id);
     }
+    emitters.clear();
     return { ok: true };
   },
 
@@ -3630,6 +3725,9 @@ if (!isHeadless && import.meta.hot) {
     // Re-render so the user sees the update
     composer.render();
   });
+
+  // On non-headless connect, request sync from server to replay command history
+  import.meta.hot.send("atelier:sync-request", {});
 }
 
 (window as any).__atelier__ = {
