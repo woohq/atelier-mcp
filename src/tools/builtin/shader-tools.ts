@@ -10,10 +10,32 @@ export function registerShaderTools(server: AtelierMcpServer): void {
       "Apply a post-processing effect to the rendered image. Effects are chained in " +
       "application order. Types: pixelate (retro pixel look), cel_shade (toon quantized " +
       "lighting), dither (Bayer matrix dithering), palette_quantize (snap colors to a " +
-      "palette), outline (Sobel edge detection).",
+      "palette), outline (Sobel edge detection), bloom (glow on bright areas), " +
+      "vignette (darken edges), chromatic_aberration (RGB channel offset), " +
+      "film_grain (animated noise), halftone (comic book dots), color_grade " +
+      "(brightness/contrast/saturation), sharpen (unsharp mask), invert (negative), " +
+      "edge_glow (neon edge effect), crosshatch (hatching shading), " +
+      "watercolor (painterly effect).",
     schema: {
       effect: z
-        .enum(["pixelate", "cel_shade", "dither", "palette_quantize", "outline"])
+        .enum([
+          "pixelate",
+          "cel_shade",
+          "dither",
+          "palette_quantize",
+          "outline",
+          "bloom",
+          "vignette",
+          "chromatic_aberration",
+          "film_grain",
+          "halftone",
+          "color_grade",
+          "sharpen",
+          "invert",
+          "edge_glow",
+          "crosshatch",
+          "watercolor",
+        ])
         .describe("Post-processing effect type"),
       params: z
         .record(z.unknown())
@@ -22,7 +44,18 @@ export function registerShaderTools(server: AtelierMcpServer): void {
           "Effect parameters. pixelate: { pixelSize: number }. cel_shade: { steps: number }. " +
             "dither: { strength: number, matrixSize: number }. " +
             "palette_quantize: { palette: number[][], paletteSize: number }. " +
-            "outline: { thickness: number, color: [r,g,b] (0-1 floats), threshold: number (0-1, default 0.1), sensitivity: number (default 1.0) }.",
+            "outline: { thickness: number, color: [r,g,b] (0-1 floats), threshold: number (0-1, default 0.1), sensitivity: number (default 1.0) }. " +
+            "bloom: { threshold: number (default 0.5), intensity: number (default 1.0) }. " +
+            "vignette: { intensity: number (default 0.5), smoothness: number (default 0.5) }. " +
+            "chromatic_aberration: { offset: number (default 0.005) }. " +
+            "film_grain: { intensity: number (default 0.3) }. " +
+            "halftone: { dotSize: number (default 4.0) }. " +
+            "color_grade: { brightness: number (default 0), contrast: number (default 1), saturation: number (default 1) }. " +
+            "sharpen: { strength: number (default 0.5) }. " +
+            "invert: no params. " +
+            "edge_glow: { threshold: number (default 0.3), color: [r,g,b] (0-1 floats, default [0,1,1]), intensity: number (default 1.5) }. " +
+            "crosshatch: { spacing: number (default 8.0), angle: number (default 0.785), weight: number (default 1.0) }. " +
+            "watercolor: { wetness: number (default 0.5), bleed: number (default 0.5), granulation: number (default 0.3) }.",
         ),
     },
     handler: async (ctx) => {

@@ -209,4 +209,136 @@ export function registerSceneTools(server: AtelierMcpServer): void {
       return makeTextResponse({ color, alpha, status: "applied" });
     },
   });
+
+  // --- set_shadow ---
+  server.registry.register({
+    name: "set_shadow",
+    description:
+      "Control shadow casting and receiving for an object. " +
+      "Shadows must be enabled on lights (directional/point) to see effects.",
+    schema: {
+      objectId: z.string().describe("ID of the object"),
+      castShadow: z.boolean().optional().describe("Whether this object casts shadows"),
+      receiveShadow: z.boolean().optional().describe("Whether this object receives shadows"),
+    },
+    handler: async (ctx) => {
+      const { objectId, castShadow, receiveShadow } = ctx.args;
+      const obj = server.scene.get(objectId);
+      if (!obj) {
+        throw new AtelierError(ErrorCode.OBJECT_NOT_FOUND, `Object "${objectId}" not found`);
+      }
+      const result = await server.bridge.execute("setShadow", {
+        objectId,
+        castShadow,
+        receiveShadow,
+      });
+      return makeTextResponse(result);
+    },
+  });
+
+  // --- set_environment ---
+  server.registry.register({
+    name: "set_environment",
+    description:
+      "Set a procedural environment map for scene lighting and reflections. " +
+      "Presets: studio (soft box lighting), neutral (even lighting), outdoor (brighter). " +
+      "No external files needed — generates environment procedurally.",
+    schema: {
+      preset: z
+        .enum(["studio", "neutral", "outdoor"])
+        .default("studio")
+        .describe("Environment preset"),
+      intensity: z
+        .number()
+        .min(0)
+        .max(5)
+        .default(1.0)
+        .describe("Environment intensity"),
+      background: z
+        .boolean()
+        .default(false)
+        .describe("Also use environment as scene background"),
+    },
+    handler: async (ctx) => {
+      const { preset, intensity, background } = ctx.args;
+      const result = await server.bridge.execute("setEnvironment", {
+        preset,
+        intensity,
+        background,
+      });
+      return makeTextResponse(result);
+    },
+  });
+
+  // --- save_camera ---
+  server.registry.register({
+    name: "save_camera",
+    description: "Save the current camera position as a named bookmark for later restoration.",
+    schema: {
+      name: z.string().min(1).describe("Bookmark name"),
+    },
+    handler: async (ctx) => {
+      const result = await server.bridge.execute("saveCamera", { name: ctx.args.name });
+      return makeTextResponse(result);
+    },
+  });
+
+  // --- restore_camera ---
+  server.registry.register({
+    name: "restore_camera",
+    description: "Restore camera to a previously saved bookmark position.",
+    schema: {
+      name: z.string().min(1).describe("Bookmark name to restore"),
+    },
+    handler: async (ctx) => {
+      const result = await server.bridge.execute("restoreCamera", { name: ctx.args.name });
+      return makeTextResponse(result);
+    },
+  });
+
+  // --- render_multi_view ---
+  server.registry.register({
+    name: "render_multi_view",
+    description:
+      "Render the scene from multiple camera angles in a single grid image. " +
+      "Available views: front, side, top_down, three_quarter, back, isometric.",
+    schema: {
+      views: z
+        .array(z.string())
+        .default(["front", "side", "top_down", "three_quarter"])
+        .describe("View names"),
+      width: z
+        .number()
+        .int()
+        .min(64)
+        .max(2048)
+        .default(512)
+        .describe("Width of each view cell"),
+      height: z
+        .number()
+        .int()
+        .min(64)
+        .max(2048)
+        .default(512)
+        .describe("Height of each view cell"),
+    },
+    handler: async (ctx) => {
+      const result = await server.bridge.execute("renderMultiView", ctx.args);
+      const data = result as {
+        image: string;
+        cols: number;
+        rows: number;
+        views: string[];
+      };
+      return {
+        content: [
+          { type: "image" as const, data: data.image, mimeType: "image/png" as const },
+          {
+            type: "text" as const,
+            text: JSON.stringify({ views: data.views, cols: data.cols, rows: data.rows }),
+          },
+        ],
+      };
+    },
+  });
 }

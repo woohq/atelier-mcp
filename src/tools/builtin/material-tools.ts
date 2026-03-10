@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { AtelierMcpServer } from "../../server/server.js";
+import { AtelierError, ErrorCode } from "../../types/errors.js";
 import { makeTextResponse } from "../response.js";
 
 export function registerMaterialTools(server: AtelierMcpServer): void {
@@ -108,6 +109,74 @@ export function registerMaterialTools(server: AtelierMcpServer): void {
         palette: paletteName ?? server.palettes.getActive()?.name ?? null,
         status: "applied",
       });
+    },
+  });
+
+  // --- set_texture ---
+  server.registry.register({
+    name: "set_texture",
+    description:
+      "Apply a texture image to a mesh. Supports diffuse, normal, roughness, " +
+      "and emissive map slots.",
+    schema: {
+      objectId: z.string().describe("ID of the mesh"),
+      imageData: z.string().describe("Base64-encoded image data"),
+      slot: z
+        .enum(["diffuse", "normal", "roughness", "emissive"])
+        .default("diffuse")
+        .describe("Texture map slot"),
+      repeat: z
+        .tuple([z.number(), z.number()])
+        .optional()
+        .describe("Texture repeat [u, v]"),
+      offset: z
+        .tuple([z.number(), z.number()])
+        .optional()
+        .describe("Texture offset [u, v]"),
+    },
+    handler: async (ctx) => {
+      const { objectId, ...rest } = ctx.args;
+      const obj = server.scene.get(objectId);
+      if (!obj)
+        throw new AtelierError(ErrorCode.OBJECT_NOT_FOUND, `Object "${objectId}" not found`);
+      const result = await server.bridge.execute("setTexture", { objectId, ...rest });
+      return makeTextResponse(result);
+    },
+  });
+
+  // --- generate_texture ---
+  server.registry.register({
+    name: "generate_texture",
+    description:
+      "Generate a procedural texture. Types: noise, checker, gradient, brick. " +
+      "Optionally apply directly to a mesh.",
+    schema: {
+      type: z.enum(["noise", "checker", "gradient", "brick"]).describe("Texture type"),
+      resolution: z
+        .number()
+        .int()
+        .min(16)
+        .max(2048)
+        .default(256)
+        .describe("Texture resolution"),
+      seed: z.number().optional().describe("Random seed"),
+      objectId: z.string().optional().describe("If provided, apply texture to this mesh"),
+      repeat: z
+        .tuple([z.number(), z.number()])
+        .optional()
+        .describe("Texture repeat [u, v]"),
+      checkSize: z.number().optional().describe("Checker: square size in pixels"),
+      direction: z
+        .enum(["horizontal", "vertical"])
+        .optional()
+        .describe("Gradient direction"),
+      brickWidth: z.number().optional().describe("Brick: width in pixels"),
+      brickHeight: z.number().optional().describe("Brick: height in pixels"),
+      mortarSize: z.number().optional().describe("Brick: mortar gap size"),
+    },
+    handler: async (ctx) => {
+      const result = await server.bridge.execute("generateTexture", ctx.args);
+      return makeTextResponse(result);
     },
   });
 }

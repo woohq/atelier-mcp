@@ -6,6 +6,7 @@ import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
 import { ShaderPass } from "three/addons/postprocessing/ShaderPass.js";
 import { OutputPass } from "three/addons/postprocessing/OutputPass.js";
 import { mergeGeometries } from "three/addons/utils/BufferGeometryUtils.js";
+import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 import { Evaluator, Brush, ADDITION, SUBTRACTION, INTERSECTION } from "three-bvh-csg";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { OBJLoader } from "three/addons/loaders/OBJLoader.js";
@@ -20,6 +21,8 @@ const renderer = new THREE.WebGLRenderer({
 });
 const isHeadless = new URLSearchParams(location.search).get("mode") === "headless";
 
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 renderer.setSize(1024, 1024);
 renderer.setPixelRatio(1);
 let currentBgColor = 0xffffff;
@@ -95,6 +98,12 @@ function addEffectPass(pass: ShaderPass): void {
   composer.addPass(pass);
   composer.addPass(outputPass);
 }
+
+// Camera bookmarks — named camera positions for quick restoration
+const cameraBookmarks = new Map<
+  string,
+  { position: [number, number, number]; lookAt: [number, number, number]; fov: number }
+>();
 
 // Object registry — maps IDs to Three.js objects
 const objects = new Map<string, THREE.Object3D>();
@@ -174,8 +183,15 @@ function colorsMatch(
 function animate() {
   requestAnimationFrame(animate);
   const delta = clock.getDelta();
+  const elapsed = clock.getElapsedTime();
   for (const mixer of mixers.values()) {
     mixer.update(delta);
+  }
+  // Update time uniform on any shader passes that use it (e.g. film_grain)
+  for (const pass of effectPasses.values()) {
+    if (pass.uniforms["time"]) {
+      pass.uniforms["time"].value = elapsed;
+    }
   }
   controls?.update();
   composer.render();
@@ -406,6 +422,380 @@ function buildPostProcessShader(type: string, params: Record<string, any>): any 
         ].join("\n"),
       };
 
+    case "bloom":
+      return {
+        uniforms: {
+          tDiffuse: { value: null },
+          resolution: { value: currentResolution.clone() },
+          threshold: { value: params.threshold ?? 0.5 },
+          intensity: { value: params.intensity ?? 1.0 },
+        },
+        vertexShader: defaultVertex,
+        fragmentShader: [
+          "uniform sampler2D tDiffuse;",
+          "uniform vec2 resolution;",
+          "uniform float threshold;",
+          "uniform float intensity;",
+          "varying vec2 vUv;",
+          "",
+          "void main() {",
+          "  vec4 color = texture2D(tDiffuse, vUv);",
+          "  vec2 texel = 1.0 / resolution;",
+          "  vec3 bloom = vec3(0.0);",
+          "  float total = 0.0;",
+          "  for (float x = -4.0; x <= 4.0; x += 1.0) {",
+          "    for (float y = -4.0; y <= 4.0; y += 1.0) {",
+          "      vec2 offset = vec2(x, y) * texel * 2.0;",
+          "      vec3 s = texture2D(tDiffuse, vUv + offset).rgb;",
+          "      float lum = dot(s, vec3(0.299, 0.587, 0.114));",
+          "      float bright = max(0.0, lum - threshold);",
+          "      float w = exp(-(x*x + y*y) / 8.0);",
+          "      bloom += s * bright * w;",
+          "      total += w;",
+          "    }",
+          "  }",
+          "  bloom /= total;",
+          "  gl_FragColor = vec4(color.rgb + bloom * intensity, color.a);",
+          "}",
+        ].join("\n"),
+      };
+
+    case "vignette":
+      return {
+        uniforms: {
+          tDiffuse: { value: null },
+          intensity: { value: params.intensity ?? 0.5 },
+          smoothness: { value: params.smoothness ?? 0.5 },
+        },
+        vertexShader: defaultVertex,
+        fragmentShader: [
+          "uniform sampler2D tDiffuse;",
+          "uniform float intensity;",
+          "uniform float smoothness;",
+          "varying vec2 vUv;",
+          "",
+          "void main() {",
+          "  vec4 color = texture2D(tDiffuse, vUv);",
+          "  vec2 center = vUv - 0.5;",
+          "  float dist = length(center);",
+          "  float vignette = 1.0 - smoothstep(0.5 - smoothness * 0.5, 0.5, dist * (1.0 + intensity));",
+          "  color.rgb *= vignette;",
+          "  gl_FragColor = color;",
+          "}",
+        ].join("\n"),
+      };
+
+    case "chromatic_aberration":
+      return {
+        uniforms: {
+          tDiffuse: { value: null },
+          offset: { value: params.offset ?? 0.005 },
+        },
+        vertexShader: defaultVertex,
+        fragmentShader: [
+          "uniform sampler2D tDiffuse;",
+          "uniform float offset;",
+          "varying vec2 vUv;",
+          "",
+          "void main() {",
+          "  vec2 dir = vUv - 0.5;",
+          "  float r = texture2D(tDiffuse, vUv + dir * offset).r;",
+          "  float g = texture2D(tDiffuse, vUv).g;",
+          "  float b = texture2D(tDiffuse, vUv - dir * offset).b;",
+          "  float a = texture2D(tDiffuse, vUv).a;",
+          "  gl_FragColor = vec4(r, g, b, a);",
+          "}",
+        ].join("\n"),
+      };
+
+    case "film_grain":
+      return {
+        uniforms: {
+          tDiffuse: { value: null },
+          intensity: { value: params.intensity ?? 0.3 },
+          time: { value: 0.0 },
+        },
+        vertexShader: defaultVertex,
+        fragmentShader: [
+          "uniform sampler2D tDiffuse;",
+          "uniform float intensity;",
+          "uniform float time;",
+          "varying vec2 vUv;",
+          "",
+          "float hash(vec2 p) {",
+          "  vec3 p3 = fract(vec3(p.xyx) * 0.1031);",
+          "  p3 += dot(p3, p3.yzx + 33.33);",
+          "  return fract((p3.x + p3.y) * p3.z);",
+          "}",
+          "",
+          "void main() {",
+          "  vec4 color = texture2D(tDiffuse, vUv);",
+          "  float noise = hash(vUv * 1000.0 + time * 100.0) * 2.0 - 1.0;",
+          "  color.rgb += noise * intensity;",
+          "  color.rgb = clamp(color.rgb, 0.0, 1.0);",
+          "  gl_FragColor = color;",
+          "}",
+        ].join("\n"),
+      };
+
+    case "halftone":
+      return {
+        uniforms: {
+          tDiffuse: { value: null },
+          resolution: { value: currentResolution.clone() },
+          dotSize: { value: params.dotSize ?? 4.0 },
+        },
+        vertexShader: defaultVertex,
+        fragmentShader: [
+          "uniform sampler2D tDiffuse;",
+          "uniform vec2 resolution;",
+          "uniform float dotSize;",
+          "varying vec2 vUv;",
+          "",
+          "void main() {",
+          "  vec2 pixelCoord = vUv * resolution;",
+          "  vec2 cell = floor(pixelCoord / dotSize) * dotSize + dotSize * 0.5;",
+          "  vec2 cellUv = cell / resolution;",
+          "  vec4 color = texture2D(tDiffuse, cellUv);",
+          "  float lum = dot(color.rgb, vec3(0.299, 0.587, 0.114));",
+          "  float dist = length(pixelCoord - cell) / (dotSize * 0.5);",
+          "  float radius = 1.0 - lum;",
+          "  float dot = smoothstep(radius + 0.1, radius - 0.1, dist);",
+          "  gl_FragColor = vec4(color.rgb * dot, color.a);",
+          "}",
+        ].join("\n"),
+      };
+
+    case "color_grade":
+      return {
+        uniforms: {
+          tDiffuse: { value: null },
+          brightness: { value: params.brightness ?? 0.0 },
+          contrast: { value: params.contrast ?? 1.0 },
+          saturation: { value: params.saturation ?? 1.0 },
+        },
+        vertexShader: defaultVertex,
+        fragmentShader: [
+          "uniform sampler2D tDiffuse;",
+          "uniform float brightness;",
+          "uniform float contrast;",
+          "uniform float saturation;",
+          "varying vec2 vUv;",
+          "",
+          "void main() {",
+          "  vec4 color = texture2D(tDiffuse, vUv);",
+          "  color.rgb += brightness;",
+          "  color.rgb = (color.rgb - 0.5) * contrast + 0.5;",
+          "  float lum = dot(color.rgb, vec3(0.299, 0.587, 0.114));",
+          "  color.rgb = mix(vec3(lum), color.rgb, saturation);",
+          "  color.rgb = clamp(color.rgb, 0.0, 1.0);",
+          "  gl_FragColor = color;",
+          "}",
+        ].join("\n"),
+      };
+
+    case "sharpen":
+      return {
+        uniforms: {
+          tDiffuse: { value: null },
+          resolution: { value: currentResolution.clone() },
+          strength: { value: params.strength ?? 0.5 },
+        },
+        vertexShader: defaultVertex,
+        fragmentShader: [
+          "uniform sampler2D tDiffuse;",
+          "uniform vec2 resolution;",
+          "uniform float strength;",
+          "varying vec2 vUv;",
+          "",
+          "void main() {",
+          "  vec2 texel = 1.0 / resolution;",
+          "  vec4 center = texture2D(tDiffuse, vUv);",
+          "  vec4 top    = texture2D(tDiffuse, vUv + vec2(0.0, texel.y));",
+          "  vec4 bottom = texture2D(tDiffuse, vUv - vec2(0.0, texel.y));",
+          "  vec4 left   = texture2D(tDiffuse, vUv - vec2(texel.x, 0.0));",
+          "  vec4 right  = texture2D(tDiffuse, vUv + vec2(texel.x, 0.0));",
+          "  vec4 blurred = (top + bottom + left + right) * 0.25;",
+          "  vec4 sharpened = center + (center - blurred) * strength;",
+          "  sharpened = clamp(sharpened, 0.0, 1.0);",
+          "  gl_FragColor = vec4(sharpened.rgb, center.a);",
+          "}",
+        ].join("\n"),
+      };
+
+    case "invert":
+      return {
+        uniforms: {
+          tDiffuse: { value: null },
+        },
+        vertexShader: defaultVertex,
+        fragmentShader: [
+          "uniform sampler2D tDiffuse;",
+          "varying vec2 vUv;",
+          "",
+          "void main() {",
+          "  vec4 color = texture2D(tDiffuse, vUv);",
+          "  gl_FragColor = vec4(1.0 - color.rgb, color.a);",
+          "}",
+        ].join("\n"),
+      };
+
+    case "edge_glow": {
+      const glowColor = params.color ?? [0, 1, 1];
+      return {
+        uniforms: {
+          tDiffuse: { value: null },
+          resolution: { value: currentResolution.clone() },
+          threshold: { value: params.threshold ?? 0.3 },
+          glowColor: {
+            value: new THREE.Vector3(glowColor[0], glowColor[1], glowColor[2]),
+          },
+          intensity: { value: params.intensity ?? 1.5 },
+        },
+        vertexShader: defaultVertex,
+        fragmentShader: [
+          "uniform sampler2D tDiffuse;",
+          "uniform vec2 resolution;",
+          "uniform float threshold;",
+          "uniform vec3 glowColor;",
+          "uniform float intensity;",
+          "varying vec2 vUv;",
+          "",
+          "float luminance(vec3 c) {",
+          "  return dot(c, vec3(0.299, 0.587, 0.114));",
+          "}",
+          "",
+          "void main() {",
+          "  vec2 texel = 1.0 / resolution;",
+          "  vec4 color = texture2D(tDiffuse, vUv);",
+          "  float tl = luminance(texture2D(tDiffuse, vUv + vec2(-texel.x, texel.y)).rgb);",
+          "  float t  = luminance(texture2D(tDiffuse, vUv + vec2(0.0, texel.y)).rgb);",
+          "  float tr = luminance(texture2D(tDiffuse, vUv + vec2(texel.x, texel.y)).rgb);",
+          "  float l  = luminance(texture2D(tDiffuse, vUv + vec2(-texel.x, 0.0)).rgb);",
+          "  float r  = luminance(texture2D(tDiffuse, vUv + vec2(texel.x, 0.0)).rgb);",
+          "  float bl = luminance(texture2D(tDiffuse, vUv + vec2(-texel.x, -texel.y)).rgb);",
+          "  float b  = luminance(texture2D(tDiffuse, vUv + vec2(0.0, -texel.y)).rgb);",
+          "  float br = luminance(texture2D(tDiffuse, vUv + vec2(texel.x, -texel.y)).rgb);",
+          "  float gx = tl + 2.0*l + bl - tr - 2.0*r - br;",
+          "  float gy = tl + 2.0*t + tr - bl - 2.0*b - br;",
+          "  float edge = sqrt(gx*gx + gy*gy);",
+          "  float edgeMask = smoothstep(threshold * 0.5, threshold, edge);",
+          "  vec3 glow = glowColor * edgeMask * intensity;",
+          "  gl_FragColor = vec4(color.rgb + glow, color.a);",
+          "}",
+        ].join("\n"),
+      };
+    }
+
+    case "crosshatch":
+      return {
+        uniforms: {
+          tDiffuse: { value: null },
+          resolution: { value: currentResolution.clone() },
+          spacing: { value: params.spacing ?? 8.0 },
+          angle: { value: params.angle ?? 0.785 },
+          weight: { value: params.weight ?? 1.0 },
+        },
+        vertexShader: defaultVertex,
+        fragmentShader: [
+          "uniform sampler2D tDiffuse;",
+          "uniform vec2 resolution;",
+          "uniform float spacing;",
+          "uniform float angle;",
+          "uniform float weight;",
+          "varying vec2 vUv;",
+          "",
+          "float hatchLine(vec2 pos, float ang, float sp) {",
+          "  float c = cos(ang);",
+          "  float s = sin(ang);",
+          "  float d = abs(mod(pos.x * c + pos.y * s, sp) - sp * 0.5);",
+          "  return smoothstep(0.0, weight, d);",
+          "}",
+          "",
+          "void main() {",
+          "  vec4 color = texture2D(tDiffuse, vUv);",
+          "  float lum = dot(color.rgb, vec3(0.299, 0.587, 0.114));",
+          "  vec2 pixelCoord = vUv * resolution;",
+          "  float hatch = 1.0;",
+          "  if (lum < 0.8) {",
+          "    hatch *= hatchLine(pixelCoord, angle, spacing);",
+          "  }",
+          "  if (lum < 0.5) {",
+          "    hatch *= hatchLine(pixelCoord, angle + 1.5708, spacing);",
+          "  }",
+          "  if (lum < 0.3) {",
+          "    hatch *= hatchLine(pixelCoord, angle + 0.7854, spacing * 0.75);",
+          "  }",
+          "  if (lum < 0.15) {",
+          "    hatch *= hatchLine(pixelCoord, angle + 2.3562, spacing * 0.75);",
+          "  }",
+          "  gl_FragColor = vec4(color.rgb * hatch, color.a);",
+          "}",
+        ].join("\n"),
+      };
+
+    case "watercolor":
+      return {
+        uniforms: {
+          tDiffuse: { value: null },
+          resolution: { value: currentResolution.clone() },
+          wetness: { value: params.wetness ?? 0.5 },
+          bleed: { value: params.bleed ?? 0.5 },
+          granulation: { value: params.granulation ?? 0.3 },
+        },
+        vertexShader: defaultVertex,
+        fragmentShader: [
+          "uniform sampler2D tDiffuse;",
+          "uniform vec2 resolution;",
+          "uniform float wetness;",
+          "uniform float bleed;",
+          "uniform float granulation;",
+          "varying vec2 vUv;",
+          "",
+          "float hash(vec2 p) {",
+          "  vec3 p3 = fract(vec3(p.xyx) * 0.1031);",
+          "  p3 += dot(p3, p3.yzx + 33.33);",
+          "  return fract((p3.x + p3.y) * p3.z);",
+          "}",
+          "",
+          "float noise(vec2 p) {",
+          "  vec2 i = floor(p);",
+          "  vec2 f = fract(p);",
+          "  f = f * f * (3.0 - 2.0 * f);",
+          "  float a = hash(i);",
+          "  float b = hash(i + vec2(1.0, 0.0));",
+          "  float c = hash(i + vec2(0.0, 1.0));",
+          "  float d = hash(i + vec2(1.0, 1.0));",
+          "  return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);",
+          "}",
+          "",
+          "void main() {",
+          "  vec2 texel = 1.0 / resolution;",
+          "  float paper = noise(vUv * resolution * 0.5) * granulation;",
+          "  float n1 = noise(vUv * resolution * 0.3);",
+          "  float n2 = noise(vUv * resolution * 0.3 + 100.0);",
+          "  vec2 bleedOffset = (vec2(n1, n2) - 0.5) * bleed * texel * 10.0;",
+          "  vec4 color = vec4(0.0);",
+          "  float totalWeight = 0.0;",
+          "  for (float x = -2.0; x <= 2.0; x += 1.0) {",
+          "    for (float y = -2.0; y <= 2.0; y += 1.0) {",
+          "      vec2 off = vec2(x, y) * texel * wetness * 3.0 + bleedOffset;",
+          "      float w = exp(-(x*x + y*y) / (2.0 * wetness + 0.5));",
+          "      color += texture2D(tDiffuse, vUv + off) * w;",
+          "      totalWeight += w;",
+          "    }",
+          "  }",
+          "  color /= totalWeight;",
+          "  color.rgb = mix(color.rgb, color.rgb + paper * 0.3, granulation);",
+          "  float lum = dot(color.rgb, vec3(0.299, 0.587, 0.114));",
+          "  float edgeDarken = noise(vUv * resolution * 0.1) * wetness * 0.15;",
+          "  color.rgb = mix(color.rgb, vec3(lum), edgeDarken);",
+          "  color.rgb = clamp(color.rgb, 0.0, 1.0);",
+          "  gl_FragColor = color;",
+          "}",
+        ].join("\n"),
+      };
+
     default:
       throw new Error(`Unknown post-process effect type: ${type}`);
   }
@@ -513,6 +903,8 @@ const commands: Record<string, CommandHandler> = {
     });
     const mesh = new THREE.Mesh(geometry, material);
     mesh.name = params.id;
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
 
     if (params.position) {
       mesh.position.set(params.position[0], params.position[1], params.position[2]);
@@ -559,6 +951,8 @@ const commands: Record<string, CommandHandler> = {
     const material = new THREE.MeshStandardMaterial({ color: params.color ?? 0xcccccc });
     const mesh = new THREE.Mesh(geometry, material);
     mesh.name = params.id;
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
 
     if (params.position) {
       mesh.position.set(params.position[0], params.position[1], params.position[2]);
@@ -634,6 +1028,153 @@ const commands: Record<string, CommandHandler> = {
     return { ok: true };
   },
 
+  setTexture(params) {
+    const obj = objects.get(params.objectId);
+    if (!obj || !(obj instanceof THREE.Mesh)) throw new Error("Mesh not found");
+
+    // Decode base64 image
+    const texBytes = Uint8Array.from(atob(params.imageData), (c) => c.charCodeAt(0));
+    const texBlob = new Blob([texBytes]);
+    const texUrl = URL.createObjectURL(texBlob);
+
+    const texLoader = new THREE.TextureLoader();
+    const texture = texLoader.load(texUrl, () => {
+      URL.revokeObjectURL(texUrl);
+    });
+
+    if (params.repeat) {
+      texture.repeat.set(params.repeat[0], params.repeat[1]);
+      texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
+    }
+    if (params.offset) {
+      texture.offset.set(params.offset[0], params.offset[1]);
+    }
+
+    const mat = obj.material;
+    if (mat instanceof THREE.MeshStandardMaterial) {
+      const slot = params.slot ?? "diffuse";
+      if (slot === "diffuse" || slot === "map") mat.map = texture;
+      else if (slot === "normal") mat.normalMap = texture;
+      else if (slot === "roughness") mat.roughnessMap = texture;
+      else if (slot === "emissive") mat.emissiveMap = texture;
+      mat.needsUpdate = true;
+    }
+
+    return { objectId: params.objectId, slot: params.slot ?? "diffuse" };
+  },
+
+  generateTexture(params) {
+    const texResolution = params.resolution ?? 256;
+    const texCanvas = document.createElement("canvas");
+    texCanvas.width = texResolution;
+    texCanvas.height = texResolution;
+    const texCtx = texCanvas.getContext("2d")!;
+
+    const texType = params.type ?? "noise";
+    const texSeed = params.seed ?? 0;
+
+    function texHash(x: number, y: number): number {
+      const h = Math.sin(x * 12.9898 + y * 78.233 + texSeed * 43.12) * 43758.5453;
+      return h - Math.floor(h);
+    }
+
+    const imgData = texCtx.createImageData(texResolution, texResolution);
+
+    switch (texType) {
+      case "noise": {
+        for (let y = 0; y < texResolution; y++) {
+          for (let x = 0; x < texResolution; x++) {
+            const v = texHash(x, y) * 255;
+            const i = (y * texResolution + x) * 4;
+            imgData.data[i] = imgData.data[i + 1] = imgData.data[i + 2] = v;
+            imgData.data[i + 3] = 255;
+          }
+        }
+        break;
+      }
+      case "checker": {
+        const checkSize = params.checkSize ?? 32;
+        for (let y = 0; y < texResolution; y++) {
+          for (let x = 0; x < texResolution; x++) {
+            const isWhite =
+              (Math.floor(x / checkSize) + Math.floor(y / checkSize)) % 2 === 0;
+            const v = isWhite ? 255 : 0;
+            const i = (y * texResolution + x) * 4;
+            imgData.data[i] = imgData.data[i + 1] = imgData.data[i + 2] = v;
+            imgData.data[i + 3] = 255;
+          }
+        }
+        break;
+      }
+      case "gradient": {
+        const texDir = params.direction ?? "horizontal";
+        for (let y = 0; y < texResolution; y++) {
+          for (let x = 0; x < texResolution; x++) {
+            const t = texDir === "horizontal" ? x / texResolution : y / texResolution;
+            const v = t * 255;
+            const i = (y * texResolution + x) * 4;
+            imgData.data[i] = imgData.data[i + 1] = imgData.data[i + 2] = v;
+            imgData.data[i + 3] = 255;
+          }
+        }
+        break;
+      }
+      case "brick": {
+        const brickW = params.brickWidth ?? 32;
+        const brickH = params.brickHeight ?? 16;
+        const mortarSize = params.mortarSize ?? 2;
+        for (let y = 0; y < texResolution; y++) {
+          for (let x = 0; x < texResolution; x++) {
+            const brickRow = Math.floor(y / brickH);
+            const offsetX = brickRow % 2 === 0 ? 0 : brickW / 2;
+            const bx = (x + offsetX) % brickW;
+            const by = y % brickH;
+            const isMortar = bx < mortarSize || by < mortarSize;
+            const v = isMortar
+              ? 128
+              : 200 + texHash(Math.floor((x + offsetX) / brickW), brickRow) * 40;
+            const i = (y * texResolution + x) * 4;
+            imgData.data[i] = v;
+            imgData.data[i + 1] = v * 0.85;
+            imgData.data[i + 2] = v * 0.7;
+            imgData.data[i + 3] = 255;
+          }
+        }
+        break;
+      }
+      default: {
+        for (let y = 0; y < texResolution; y++) {
+          for (let x = 0; x < texResolution; x++) {
+            const i = (y * texResolution + x) * 4;
+            imgData.data[i] = imgData.data[i + 1] = imgData.data[i + 2] = 128;
+            imgData.data[i + 3] = 255;
+          }
+        }
+      }
+    }
+
+    texCtx.putImageData(imgData, 0, 0);
+
+    if (params.objectId) {
+      const obj = objects.get(params.objectId);
+      if (obj && obj instanceof THREE.Mesh) {
+        const genTexture = new THREE.CanvasTexture(texCanvas);
+        if (params.repeat) {
+          genTexture.repeat.set(params.repeat[0], params.repeat[1]);
+          genTexture.wrapS = genTexture.wrapT = THREE.RepeatWrapping;
+        }
+        const mat = obj.material;
+        if (mat instanceof THREE.MeshStandardMaterial) {
+          mat.map = genTexture;
+          mat.needsUpdate = true;
+        }
+      }
+    }
+
+    const dataUrl = texCanvas.toDataURL("image/png");
+    return { type: texType, resolution: texResolution, dataUrl: dataUrl.split(",")[1] };
+  },
+
   setCamera(params) {
     if (params.preset) {
       const presets: Record<string, { position: number[]; lookAt: number[] }> = {
@@ -674,21 +1215,36 @@ const commands: Record<string, CommandHandler> = {
   setLight(params) {
     let light: THREE.Light;
     switch (params.type) {
-      case "directional":
-        light = new THREE.DirectionalLight(params.color ?? 0xffffff, params.intensity ?? 1);
+      case "directional": {
+        const dirLight = new THREE.DirectionalLight(
+          params.color ?? 0xffffff,
+          params.intensity ?? 1,
+        );
         if (params.position) {
-          light.position.set(params.position[0], params.position[1], params.position[2]);
+          dirLight.position.set(params.position[0], params.position[1], params.position[2]);
         }
+        dirLight.castShadow = true;
+        dirLight.shadow.camera.left = -10;
+        dirLight.shadow.camera.right = 10;
+        dirLight.shadow.camera.top = 10;
+        dirLight.shadow.camera.bottom = -10;
+        dirLight.shadow.mapSize.width = 2048;
+        dirLight.shadow.mapSize.height = 2048;
+        light = dirLight;
         break;
+      }
       case "ambient":
         light = new THREE.AmbientLight(params.color ?? 0x404040, params.intensity ?? 1);
         break;
-      case "point":
-        light = new THREE.PointLight(params.color ?? 0xffffff, params.intensity ?? 1);
+      case "point": {
+        const ptLight = new THREE.PointLight(params.color ?? 0xffffff, params.intensity ?? 1);
         if (params.position) {
-          light.position.set(params.position[0], params.position[1], params.position[2]);
+          ptLight.position.set(params.position[0], params.position[1], params.position[2]);
         }
+        ptLight.castShadow = true;
+        light = ptLight;
         break;
+      }
       default:
         throw new Error(`Unknown light type: ${params.type}`);
     }
@@ -697,6 +1253,22 @@ const commands: Record<string, CommandHandler> = {
     scene.add(light);
     objects.set(params.id, light);
     return { id: params.id };
+  },
+
+  setShadow(params) {
+    const obj = objects.get(params.objectId);
+    if (!obj) throw new Error(`Object "${params.objectId}" not found`);
+    if (params.castShadow !== undefined) obj.castShadow = params.castShadow;
+    if (params.receiveShadow !== undefined) obj.receiveShadow = params.receiveShadow;
+    obj.traverse((child) => {
+      if (params.castShadow !== undefined) child.castShadow = params.castShadow;
+      if (params.receiveShadow !== undefined) child.receiveShadow = params.receiveShadow;
+    });
+    return {
+      objectId: params.objectId,
+      castShadow: obj.castShadow,
+      receiveShadow: obj.receiveShadow,
+    };
   },
 
   booleanOp(params) {
@@ -1598,6 +2170,56 @@ const commands: Record<string, CommandHandler> = {
     currentBgAlpha = alpha;
     renderer.setClearColor(currentBgColor, currentBgAlpha);
     return { color: currentBgColor, alpha: currentBgAlpha };
+  },
+
+  setEnvironment(params) {
+    const preset = params.preset ?? "studio";
+    const intensity = params.intensity ?? 1.0;
+
+    const pmremGenerator = new THREE.PMREMGenerator(renderer);
+    pmremGenerator.compileEquirectangularShader();
+
+    const envScene = new RoomEnvironment();
+    const envMap = pmremGenerator.fromScene(envScene, 0.04).texture;
+    scene.environment = envMap;
+    scene.environmentIntensity = intensity;
+
+    if (params.background) {
+      scene.background = envMap;
+    }
+
+    pmremGenerator.dispose();
+    envScene.traverse((child) => {
+      if (child instanceof THREE.Mesh) {
+        child.geometry.dispose();
+        if (child.material instanceof THREE.Material) child.material.dispose();
+      }
+    });
+
+    return { preset, intensity, background: params.background ?? false };
+  },
+
+  saveCamera(params) {
+    const pos = camera.position.toArray() as [number, number, number];
+    const dir = new THREE.Vector3();
+    camera.getWorldDirection(dir);
+    const lookAt = camera.position
+      .clone()
+      .add(dir.multiplyScalar(10))
+      .toArray() as [number, number, number];
+    const bookmark = { position: pos, lookAt, fov: camera.fov };
+    cameraBookmarks.set(params.name, bookmark);
+    return { name: params.name, ...bookmark };
+  },
+
+  restoreCamera(params) {
+    const bookmark = cameraBookmarks.get(params.name);
+    if (!bookmark) throw new Error(`Camera bookmark "${params.name}" not found`);
+    camera.position.set(...bookmark.position);
+    camera.lookAt(...bookmark.lookAt);
+    camera.fov = bookmark.fov;
+    camera.updateProjectionMatrix();
+    return { name: params.name, restored: true };
   },
 
   listObjects() {
@@ -2891,6 +3513,65 @@ const asyncCommands: Record<string, AsyncCommandHandler> = {
 
     return { id, format, vertexCount, childCount: resultObj.children.length };
   },
+
+  async renderMultiView(params) {
+    const mvWidth = params.width ?? 512;
+    const mvHeight = params.height ?? 512;
+    const views = params.views ?? ["front", "side", "top_down", "three_quarter"];
+
+    const savedPos = camera.position.clone();
+    const savedFov = camera.fov;
+
+    const presets: Record<
+      string,
+      { position: [number, number, number]; lookAt: [number, number, number] }
+    > = {
+      front: { position: [0, 1, 5], lookAt: [0, 0.5, 0] },
+      side: { position: [5, 1, 0], lookAt: [0, 0.5, 0] },
+      top_down: { position: [0, 5, 0.01], lookAt: [0, 0, 0] },
+      three_quarter: { position: [3, 3, 3], lookAt: [0, 0.5, 0] },
+      back: { position: [0, 1, -5], lookAt: [0, 0.5, 0] },
+      isometric: { position: [3, 3, 3], lookAt: [0, 0, 0] },
+    };
+
+    const cols = 2;
+    const rows = Math.ceil(views.length / cols);
+
+    const mvCanvas = document.createElement("canvas");
+    mvCanvas.width = mvWidth * cols;
+    mvCanvas.height = mvHeight * rows;
+    const mvCtx = mvCanvas.getContext("2d")!;
+
+    renderer.setSize(mvWidth, mvHeight);
+
+    for (let i = 0; i < views.length; i++) {
+      const viewName = views[i];
+      const preset = presets[viewName] ?? presets.front;
+      camera.position.set(...preset.position);
+      camera.lookAt(...preset.lookAt);
+      camera.updateProjectionMatrix();
+
+      if (composer && composer.passes.length > 1) {
+        composer.setSize(mvWidth, mvHeight);
+        composer.render();
+      } else {
+        renderer.render(scene, camera);
+      }
+
+      const col = i % cols;
+      const row = Math.floor(i / cols);
+      mvCtx.drawImage(renderer.domElement, col * mvWidth, row * mvHeight);
+    }
+
+    camera.position.copy(savedPos);
+    camera.fov = savedFov;
+    camera.updateProjectionMatrix();
+    renderer.setSize(renderer.domElement.width, renderer.domElement.height);
+
+    const dataUrl = mvCanvas.toDataURL("image/png");
+    const base64 = dataUrl.split(",")[1];
+    return { image: base64, cols, rows, views };
+  },
 };
 
 // --- RPC Interface ---
@@ -2909,6 +3590,7 @@ const noRelayCommands = new Set([
   "getScreenshot",
   "exportGltf",
   "renderSpritesheet",
+  "renderMultiView",
   "listObjects",
   "getBounds",
 ]);

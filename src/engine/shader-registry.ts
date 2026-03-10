@@ -5,7 +5,24 @@
 
 export interface PostProcessEffect {
   id: string;
-  type: "pixelate" | "cel_shade" | "dither" | "palette_quantize" | "outline" | "custom";
+  type:
+    | "pixelate"
+    | "cel_shade"
+    | "dither"
+    | "palette_quantize"
+    | "outline"
+    | "bloom"
+    | "vignette"
+    | "chromatic_aberration"
+    | "film_grain"
+    | "halftone"
+    | "color_grade"
+    | "sharpen"
+    | "invert"
+    | "edge_glow"
+    | "crosshatch"
+    | "watercolor"
+    | "custom";
   params: Record<string, unknown>;
   order: number;
 }
