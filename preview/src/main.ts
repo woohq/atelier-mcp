@@ -11,6 +11,8 @@ import { Evaluator, Brush, ADDITION, SUBTRACTION, INTERSECTION } from "three-bvh
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { OBJLoader } from "three/addons/loaders/OBJLoader.js";
 import { STLLoader } from "three/addons/loaders/STLLoader.js";
+import { TextGeometry } from "three/addons/geometries/TextGeometry.js";
+import { FontLoader } from "three/addons/loaders/FontLoader.js";
 import { initUI, updateUI } from "./ui.js";
 
 // --- Three.js Setup ---
@@ -116,6 +118,19 @@ const mixers = new Map<string, THREE.AnimationMixer>();
 
 // Animation clip registry — maps clipId to THREE.AnimationClip
 const clipStore = new Map<string, THREE.AnimationClip>();
+
+// Curve registry — maps curve IDs to THREE.Curve instances
+const curves = new Map<string, THREE.Curve<THREE.Vector3>>();
+
+// Constraint registry
+interface Constraint {
+  id: string;
+  type: "look_at" | "copy_transform";
+  params: Record<string, any>;
+  sourceId: string;
+  targetId: string;
+}
+const constraints = new Map<string, Constraint>();
 
 // Particle emitter registry
 const emitters = new Map<
@@ -234,6 +249,26 @@ function animate() {
       pass.uniforms["time"].value = elapsed;
     }
   }
+
+  // Evaluate constraints each frame
+  for (const constraint of constraints.values()) {
+    const source = objects.get(constraint.sourceId);
+    const target = objects.get(constraint.targetId);
+    if (!source || !target) continue;
+
+    if (constraint.type === "look_at") {
+      source.lookAt(target.position);
+    } else if (constraint.type === "copy_transform") {
+      const offset = constraint.params.offset ?? [0, 0, 0];
+      source.position.copy(target.position);
+      source.rotation.copy(target.rotation);
+      source.scale.copy(target.scale);
+      source.position.x += offset[0];
+      source.position.y += offset[1];
+      source.position.z += offset[2];
+    }
+  }
+
   controls?.update();
   composer.render();
 }
@@ -3375,6 +3410,335 @@ const commands: Record<string, CommandHandler> = {
     }
     return renderer.domElement.toDataURL("image/png").split(",")[1];
   },
+
+  // --- Morph Targets ---
+  createMorphTarget(params) {
+    const { objectId, targetName, deltas } = params;
+    const obj = objects.get(objectId);
+    if (!obj || !(obj instanceof THREE.Mesh)) {
+      throw new Error(`Mesh "${objectId}" not found`);
+    }
+    const geometry = obj.geometry as THREE.BufferGeometry;
+    const posAttr = geometry.getAttribute("position") as THREE.BufferAttribute;
+
+    const morphPositions = new Float32Array(posAttr.array.length);
+    morphPositions.set(posAttr.array as Float32Array);
+
+    for (const delta of deltas as { index: number; dx: number; dy: number; dz: number }[]) {
+      const i = delta.index * 3;
+      morphPositions[i] += delta.dx;
+      morphPositions[i + 1] += delta.dy;
+      morphPositions[i + 2] += delta.dz;
+    }
+
+    const morphAttr = new THREE.BufferAttribute(morphPositions, 3);
+
+    if (!geometry.morphAttributes.position) {
+      geometry.morphAttributes.position = [];
+    }
+
+    const targetIndex = (geometry.morphAttributes.position as THREE.BufferAttribute[]).length;
+    (geometry.morphAttributes.position as THREE.BufferAttribute[]).push(morphAttr);
+
+    if (!obj.morphTargetDictionary) {
+      obj.morphTargetDictionary = {};
+    }
+    obj.morphTargetDictionary[targetName] = targetIndex;
+
+    if (!obj.morphTargetInfluences) {
+      obj.morphTargetInfluences = [];
+    }
+    while (obj.morphTargetInfluences.length <= targetIndex) {
+      obj.morphTargetInfluences.push(0);
+    }
+
+    geometry.morphTargetsRelative = false;
+    return { objectId, targetName, targetIndex };
+  },
+
+  setMorphInfluence(params) {
+    const { objectId, targetName, influence } = params;
+    const obj = objects.get(objectId);
+    if (!obj || !(obj instanceof THREE.Mesh)) {
+      throw new Error(`Mesh "${objectId}" not found`);
+    }
+    if (!obj.morphTargetDictionary || !(targetName in obj.morphTargetDictionary)) {
+      throw new Error(`Morph target "${targetName}" not found on mesh "${objectId}"`);
+    }
+    const idx = obj.morphTargetDictionary[targetName];
+    if (!obj.morphTargetInfluences) {
+      throw new Error(`No morph target influences on mesh "${objectId}"`);
+    }
+    obj.morphTargetInfluences[idx] = influence;
+    return { objectId, targetName, influence };
+  },
+
+  // --- Curves / Splines ---
+  createCurve(params) {
+    const { id, type, points, closed, tension, tubularSegments, radius } = params;
+    const vec3Points = (points as number[][]).map(
+      (p: number[]) => new THREE.Vector3(p[0], p[1], p[2]),
+    );
+
+    let curve: THREE.Curve<THREE.Vector3>;
+    if (type === "bezier") {
+      if (vec3Points.length !== 4) {
+        throw new Error("Bezier curve requires exactly 4 control points");
+      }
+      curve = new THREE.CubicBezierCurve3(
+        vec3Points[0],
+        vec3Points[1],
+        vec3Points[2],
+        vec3Points[3],
+      );
+    } else {
+      const catmull = new THREE.CatmullRomCurve3(vec3Points, closed ?? false);
+      if (tension !== undefined) {
+        catmull.tension = tension;
+      }
+      curve = catmull;
+    }
+
+    curves.set(id, curve);
+
+    if (radius && radius > 0) {
+      const geometry = new THREE.TubeGeometry(
+        curve,
+        tubularSegments ?? 64,
+        radius,
+        8,
+        closed ?? false,
+      );
+      const material = new THREE.MeshStandardMaterial({ color: 0xcccccc });
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.name = id;
+      scene.add(mesh);
+      objects.set(id, mesh);
+      return { id, type, visualized: "tube", radius };
+    } else {
+      const sampledPoints = curve.getPoints(tubularSegments ?? 50);
+      const lineGeometry = new THREE.BufferGeometry().setFromPoints(sampledPoints);
+      const lineMaterial = new THREE.LineBasicMaterial({ color: 0xcccccc });
+      const line = new THREE.Line(lineGeometry, lineMaterial);
+      line.name = id;
+      scene.add(line);
+      objects.set(id, line);
+      return { id, type, visualized: "line" };
+    }
+  },
+
+  sampleCurve(params) {
+    const { id, t } = params;
+    const curve = curves.get(id);
+    if (!curve) {
+      throw new Error(`Curve "${id}" not found`);
+    }
+    const point = curve.getPointAt(t);
+    const tangent = curve.getTangentAt(t);
+    return {
+      point: [point.x, point.y, point.z],
+      tangent: [tangent.x, tangent.y, tangent.z],
+    };
+  },
+
+  curveToMesh(params) {
+    const { id, newId, radius, segments, radialSegments } = params;
+    const curve = curves.get(id);
+    if (!curve) {
+      throw new Error(`Curve "${id}" not found`);
+    }
+    const geometry = new THREE.TubeGeometry(
+      curve,
+      segments ?? 64,
+      radius ?? 0.1,
+      radialSegments ?? 8,
+      false,
+    );
+    const material = new THREE.MeshStandardMaterial({ color: 0xcccccc });
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.name = newId;
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    scene.add(mesh);
+    objects.set(newId, mesh);
+    return { id: newId, fromCurve: id };
+  },
+
+  // --- Constraints ---
+  addConstraint(params) {
+    const { id, type, sourceId, targetId, offset } = params;
+    const source = objects.get(sourceId);
+    const target = objects.get(targetId);
+    if (!source) throw new Error(`Source object "${sourceId}" not found`);
+    if (!target) throw new Error(`Target object "${targetId}" not found`);
+    const constraint: Constraint = {
+      id,
+      type,
+      sourceId,
+      targetId,
+      params: { offset: offset ?? [0, 0, 0] },
+    };
+    constraints.set(id, constraint);
+    return { id, type, sourceId, targetId };
+  },
+
+  removeConstraint(params) {
+    const { id } = params;
+    if (!constraints.has(id)) throw new Error(`Constraint "${id}" not found`);
+    constraints.delete(id);
+    return { id, removed: true };
+  },
+
+  // --- Alignment / Distribution ---
+  alignObjects(params) {
+    const { objectIds, axis, alignment } = params as {
+      objectIds: string[];
+      axis: "x" | "y" | "z";
+      alignment: "min" | "center" | "max";
+    };
+    const objs: THREE.Object3D[] = [];
+    for (const oid of objectIds) {
+      const obj = objects.get(oid);
+      if (!obj) throw new Error(`Object "${oid}" not found`);
+      objs.push(obj);
+    }
+
+    const boxes = objs.map((obj) => new THREE.Box3().setFromObject(obj));
+
+    let targetValue: number;
+    if (alignment === "min") {
+      targetValue = Math.min(...boxes.map((b) => b.min[axis]));
+    } else if (alignment === "max") {
+      targetValue = Math.max(...boxes.map((b) => b.max[axis]));
+    } else {
+      const centers = boxes.map((b) => (b.min[axis] + b.max[axis]) / 2);
+      targetValue = centers.reduce((a, b) => a + b, 0) / centers.length;
+    }
+
+    for (let i = 0; i < objs.length; i++) {
+      const box = boxes[i];
+      const obj = objs[i];
+      if (alignment === "min") {
+        obj.position[axis] += targetValue - box.min[axis];
+      } else if (alignment === "max") {
+        obj.position[axis] += targetValue - box.max[axis];
+      } else {
+        const currentCenter = (box.min[axis] + box.max[axis]) / 2;
+        obj.position[axis] += targetValue - currentCenter;
+      }
+    }
+
+    return { aligned: objectIds.length, axis, alignment, targetValue };
+  },
+
+  distributeObjects(params) {
+    const { objectIds, axis } = params as {
+      objectIds: string[];
+      axis: "x" | "y" | "z";
+    };
+    const objs: THREE.Object3D[] = [];
+    for (const oid of objectIds) {
+      const obj = objects.get(oid);
+      if (!obj) throw new Error(`Object "${oid}" not found`);
+      objs.push(obj);
+    }
+
+    const indexed = objs.map((obj, i) => ({ obj, idx: i, pos: obj.position[axis] }));
+    indexed.sort((a, b) => a.pos - b.pos);
+
+    const minPos = indexed[0].pos;
+    const maxPos = indexed[indexed.length - 1].pos;
+    const step = (maxPos - minPos) / (indexed.length - 1);
+
+    for (let i = 0; i < indexed.length; i++) {
+      indexed[i].obj.position[axis] = minPos + step * i;
+    }
+
+    return { distributed: objectIds.length, axis };
+  },
+
+  snapToGround(params) {
+    const { objectId } = params;
+    const obj = objects.get(objectId);
+    if (!obj) throw new Error(`Object "${objectId}" not found`);
+
+    const box = new THREE.Box3().setFromObject(obj);
+    const offsetY = -box.min.y;
+    obj.position.y += offsetY;
+
+    return { objectId, offsetY };
+  },
+
+  // --- Mesh Analysis ---
+  analyzeMesh(params) {
+    const { objectId } = params;
+    const obj = objects.get(objectId);
+    if (!obj) throw new Error(`Object "${objectId}" not found`);
+    if (!(obj instanceof THREE.Mesh)) throw new Error(`Object "${objectId}" is not a mesh`);
+
+    const geometry = obj.geometry as THREE.BufferGeometry;
+    const posAttr = geometry.getAttribute("position");
+    const vertexCount = posAttr ? posAttr.count : 0;
+
+    const index = geometry.getIndex();
+    const faceCount = index ? index.count / 3 : vertexCount / 3;
+
+    geometry.computeBoundingBox();
+    const bb = geometry.boundingBox!;
+    const boundingBox = {
+      min: { x: bb.min.x, y: bb.min.y, z: bb.min.z },
+      max: { x: bb.max.x, y: bb.max.y, z: bb.max.z },
+    };
+
+    const hasNormals = geometry.getAttribute("normal") !== undefined;
+    const hasUVs = geometry.getAttribute("uv") !== undefined;
+
+    let surfaceArea = 0;
+    const vA = new THREE.Vector3();
+    const vB = new THREE.Vector3();
+    const vC = new THREE.Vector3();
+    const ab = new THREE.Vector3();
+    const ac = new THREE.Vector3();
+
+    if (index) {
+      for (let i = 0; i < index.count; i += 3) {
+        const a = index.getX(i);
+        const b = index.getX(i + 1);
+        const c = index.getX(i + 2);
+        vA.fromBufferAttribute(posAttr, a);
+        vB.fromBufferAttribute(posAttr, b);
+        vC.fromBufferAttribute(posAttr, c);
+        ab.subVectors(vB, vA);
+        ac.subVectors(vC, vA);
+        surfaceArea += ab.cross(ac).length() * 0.5;
+      }
+    } else {
+      for (let i = 0; i < vertexCount; i += 3) {
+        vA.fromBufferAttribute(posAttr, i);
+        vB.fromBufferAttribute(posAttr, i + 1);
+        vC.fromBufferAttribute(posAttr, i + 2);
+        ab.subVectors(vB, vA);
+        ac.subVectors(vC, vA);
+        surfaceArea += ab.cross(ac).length() * 0.5;
+      }
+    }
+
+    return {
+      vertexCount,
+      faceCount,
+      boundingBox,
+      surfaceArea: Math.round(surfaceArea * 1000) / 1000,
+      hasNormals,
+      hasUVs,
+    };
+  },
+
+  setObjectVisibility(params) {
+    const obj = objects.get(params.objectId);
+    if (!obj) throw new Error(`Object "${params.objectId}" not found`);
+    obj.visible = params.visible;
+    return { objectId: params.objectId, visible: params.visible };
+  },
 };
 
 // --- Async Command Handlers ---
@@ -3667,6 +4031,409 @@ const asyncCommands: Record<string, AsyncCommandHandler> = {
     const base64 = dataUrl.split(",")[1];
     return { image: base64, cols, rows, views };
   },
+
+  async createText(params) {
+    const {
+      id,
+      text,
+      size = 1,
+      depth = 0.2,
+      bevelEnabled = false,
+      bevelThickness = 0.05,
+      bevelSize = 0.02,
+    } = params;
+
+    const loader = new FontLoader();
+    const font = await new Promise<any>((resolve, reject) => {
+      loader.load(
+        "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/fonts/helvetiker_regular.typeface.json",
+        (loadedFont) => resolve(loadedFont),
+        undefined,
+        (err) => reject(err),
+      );
+    });
+
+    const geometry = new TextGeometry(text, {
+      font,
+      size,
+      depth,
+      bevelEnabled,
+      bevelThickness,
+      bevelSize,
+      bevelSegments: 3,
+    });
+    geometry.computeBoundingBox();
+
+    const material = new THREE.MeshStandardMaterial({ color: 0xcccccc });
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.name = id;
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+
+    scene.add(mesh);
+    objects.set(id, mesh);
+
+    return { id };
+  },
+
+  async setReferenceImage(params) {
+    const {
+      id,
+      imageData,
+      position,
+      scale: scaleParam,
+      opacity,
+      mode,
+    } = params as {
+      id: string;
+      imageData: string;
+      position?: [number, number, number];
+      scale?: [number, number, number];
+      opacity?: number;
+      mode: "background" | "plane";
+    };
+
+    const img = new Image();
+    img.src = `data:image/png;base64,${imageData}`;
+    await img.decode();
+    const refTexture = new THREE.Texture(img);
+    refTexture.needsUpdate = true;
+
+    const refOpacity = opacity ?? 0.5;
+
+    // Remove existing reference image with same ID if present
+    if (objects.has(id)) {
+      const existing = objects.get(id)!;
+      existing.removeFromParent();
+      if (existing instanceof THREE.Mesh) {
+        existing.geometry.dispose();
+        if (existing.material instanceof THREE.Material) existing.material.dispose();
+      }
+      objects.delete(id);
+    }
+
+    if (mode === "background") {
+      const bgGeo = new THREE.PlaneGeometry(200, 200);
+      const bgMat = new THREE.MeshBasicMaterial({
+        map: refTexture,
+        transparent: true,
+        opacity: refOpacity,
+        depthWrite: false,
+        depthTest: false,
+        side: THREE.DoubleSide,
+      });
+      const bgMesh = new THREE.Mesh(bgGeo, bgMat);
+      bgMesh.name = id;
+      bgMesh.position.set(0, 0, -100);
+      bgMesh.renderOrder = -1;
+      scene.add(bgMesh);
+      objects.set(id, bgMesh);
+    } else {
+      const planeGeo = new THREE.PlaneGeometry(1, 1);
+      const planeMat = new THREE.MeshBasicMaterial({
+        map: refTexture,
+        transparent: true,
+        opacity: refOpacity,
+        side: THREE.DoubleSide,
+      });
+      const planeMesh = new THREE.Mesh(planeGeo, planeMat);
+      planeMesh.name = id;
+
+      if (position) {
+        planeMesh.position.set(position[0], position[1], position[2]);
+      }
+      if (scaleParam) {
+        planeMesh.scale.set(scaleParam[0], scaleParam[1], scaleParam[2]);
+      }
+
+      scene.add(planeMesh);
+      objects.set(id, planeMesh);
+    }
+
+    return { id, mode, opacity: refOpacity };
+  },
+
+  async bakeNormalMap(params) {
+    const { objectId, resolution: res } = params as { objectId: string; resolution: number };
+    const bakeRes = res ?? 512;
+
+    const obj = objects.get(objectId);
+    if (!obj) throw new Error(`Object "${objectId}" not found`);
+
+    const normalScene = new THREE.Scene();
+    const clone = obj.clone(true);
+    clone.traverse((child) => {
+      if (child instanceof THREE.Mesh) {
+        child.material = new THREE.MeshNormalMaterial();
+      }
+    });
+    normalScene.add(clone);
+
+    const box = new THREE.Box3().setFromObject(clone);
+    const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3());
+    const maxDim = Math.max(size.x, size.y, size.z);
+    const halfDim = (maxDim / 2) * 1.1;
+
+    const normalCam = new THREE.OrthographicCamera(
+      -halfDim, halfDim, halfDim, -halfDim, 0.1, maxDim * 10,
+    );
+    normalCam.position.copy(center).add(new THREE.Vector3(0, 0, maxDim * 2));
+    normalCam.lookAt(center);
+    normalCam.updateProjectionMatrix();
+
+    const rt = new THREE.WebGLRenderTarget(bakeRes, bakeRes, {
+      format: THREE.RGBAFormat,
+      type: THREE.UnsignedByteType,
+    });
+
+    renderer.setRenderTarget(rt);
+    renderer.clear();
+    renderer.render(normalScene, normalCam);
+    renderer.setRenderTarget(null);
+
+    const pixels = new Uint8Array(bakeRes * bakeRes * 4);
+    renderer.readRenderTargetPixels(rt, 0, 0, bakeRes, bakeRes, pixels);
+
+    const normalCanvas = new OffscreenCanvas(bakeRes, bakeRes);
+    const normalCtx = normalCanvas.getContext("2d")!;
+    const imageDataObj = normalCtx.createImageData(bakeRes, bakeRes);
+
+    for (let y = 0; y < bakeRes; y++) {
+      const srcRow = (bakeRes - 1 - y) * bakeRes * 4;
+      const dstRow = y * bakeRes * 4;
+      for (let x = 0; x < bakeRes * 4; x++) {
+        imageDataObj.data[dstRow + x] = pixels[srcRow + x];
+      }
+    }
+    normalCtx.putImageData(imageDataObj, 0, 0);
+
+    const blob = await normalCanvas.convertToBlob({ type: "image/png" });
+    const arrayBuffer = await blob.arrayBuffer();
+    const bytes = new Uint8Array(arrayBuffer);
+    let binary = "";
+    for (let i = 0; i < bytes.length; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+
+    rt.dispose();
+    clone.traverse((child) => {
+      if (child instanceof THREE.Mesh) {
+        child.geometry.dispose();
+        child.material.dispose();
+      }
+    });
+
+    return btoa(binary);
+  },
+
+  async bakeAO(params) {
+    const { objectId, resolution: res, samples: sampleCount } = params as {
+      objectId: string;
+      resolution: number;
+      samples: number;
+    };
+    const bakeRes = res ?? 512;
+    const numSamples = sampleCount ?? 32;
+
+    const obj = objects.get(objectId);
+    if (!obj) throw new Error(`Object "${objectId}" not found`);
+
+    const aoScene = new THREE.Scene();
+    const aoClone = obj.clone(true);
+    aoClone.traverse((child) => {
+      if (child instanceof THREE.Mesh) {
+        child.material = new THREE.MeshLambertMaterial({ color: 0xffffff });
+      }
+    });
+    aoScene.add(aoClone);
+
+    const aoBox = new THREE.Box3().setFromObject(aoClone);
+    const aoCenter = aoBox.getCenter(new THREE.Vector3());
+    const aoSize = aoBox.getSize(new THREE.Vector3());
+    const aoMaxDim = Math.max(aoSize.x, aoSize.y, aoSize.z);
+    const aoHalfDim = (aoMaxDim / 2) * 1.1;
+
+    const aoCam = new THREE.OrthographicCamera(
+      -aoHalfDim, aoHalfDim, aoHalfDim, -aoHalfDim, 0.1, aoMaxDim * 10,
+    );
+    aoCam.position.copy(aoCenter).add(new THREE.Vector3(0, 0, aoMaxDim * 2));
+    aoCam.lookAt(aoCenter);
+    aoCam.updateProjectionMatrix();
+
+    const aoRT = new THREE.WebGLRenderTarget(bakeRes, bakeRes, {
+      format: THREE.RGBAFormat,
+      type: THREE.UnsignedByteType,
+    });
+
+    const accumulator = new Float32Array(bakeRes * bakeRes * 4);
+    const tempPixels = new Uint8Array(bakeRes * bakeRes * 4);
+
+    for (let s = 0; s < numSamples; s++) {
+      const lightsToRemove: THREE.Object3D[] = [];
+      aoScene.traverse((child) => {
+        if (child instanceof THREE.Light) lightsToRemove.push(child);
+      });
+      for (const l of lightsToRemove) aoScene.remove(l);
+
+      const theta = Math.random() * Math.PI * 2;
+      const phi = Math.acos(Math.random());
+      const lightDir = new THREE.Vector3(
+        Math.sin(phi) * Math.cos(theta),
+        Math.cos(phi),
+        Math.sin(phi) * Math.sin(theta),
+      );
+      lightDir.multiplyScalar(aoMaxDim * 3);
+      lightDir.add(aoCenter);
+
+      const aoLight = new THREE.DirectionalLight(0xffffff, 1.0);
+      aoLight.position.copy(lightDir);
+      aoLight.lookAt(aoCenter);
+      aoScene.add(aoLight);
+
+      const aoAmbient = new THREE.AmbientLight(0xffffff, 0.05);
+      aoScene.add(aoAmbient);
+
+      renderer.setRenderTarget(aoRT);
+      renderer.clear();
+      renderer.render(aoScene, aoCam);
+      renderer.setRenderTarget(null);
+
+      renderer.readRenderTargetPixels(aoRT, 0, 0, bakeRes, bakeRes, tempPixels);
+
+      for (let i = 0; i < tempPixels.length; i++) {
+        accumulator[i] += tempPixels[i];
+      }
+    }
+
+    const aoCanvas = new OffscreenCanvas(bakeRes, bakeRes);
+    const aoCtx = aoCanvas.getContext("2d")!;
+    const aoImageData = aoCtx.createImageData(bakeRes, bakeRes);
+
+    for (let y = 0; y < bakeRes; y++) {
+      const srcRow = (bakeRes - 1 - y) * bakeRes * 4;
+      const dstRow = y * bakeRes * 4;
+      for (let x = 0; x < bakeRes * 4; x++) {
+        aoImageData.data[dstRow + x] = Math.round(accumulator[srcRow + x] / numSamples);
+      }
+    }
+    aoCtx.putImageData(aoImageData, 0, 0);
+
+    const aoBlob = await aoCanvas.convertToBlob({ type: "image/png" });
+    const aoArrayBuffer = await aoBlob.arrayBuffer();
+    const aoBytes = new Uint8Array(aoArrayBuffer);
+    let aoBinary = "";
+    for (let i = 0; i < aoBytes.length; i++) {
+      aoBinary += String.fromCharCode(aoBytes[i]);
+    }
+
+    aoRT.dispose();
+    aoClone.traverse((child) => {
+      if (child instanceof THREE.Mesh) {
+        child.geometry.dispose();
+        child.material.dispose();
+      }
+    });
+
+    return btoa(aoBinary);
+  },
+
+  async extractPalette(params) {
+    const count = (params.count as number) ?? 5;
+
+    composer.render();
+
+    const w = renderer.domElement.width;
+    const h = renderer.domElement.height;
+    const extractCanvas = document.createElement("canvas");
+    extractCanvas.width = w;
+    extractCanvas.height = h;
+    const extractCtx = extractCanvas.getContext("2d")!;
+    extractCtx.drawImage(renderer.domElement, 0, 0);
+    const imageData = extractCtx.getImageData(0, 0, w, h);
+
+    const epPixels = imageData.data;
+    const totalPixels = w * h;
+
+    const samples: Array<[number, number, number]> = [];
+    const sampleStep = Math.max(1, Math.floor(totalPixels / 2000));
+    for (let i = 0; i < totalPixels; i += sampleStep) {
+      const offset = i * 4;
+      const r = epPixels[offset];
+      const g = epPixels[offset + 1];
+      const b = epPixels[offset + 2];
+      const a = epPixels[offset + 3];
+      if (a < 10) continue;
+      samples.push([r, g, b]);
+    }
+
+    if (samples.length === 0) {
+      return ["#000000"];
+    }
+
+    const centroids: Array<[number, number, number]> = [];
+    for (let i = 0; i < count; i++) {
+      const idx = Math.floor((i * samples.length) / count);
+      centroids.push([...samples[idx]]);
+    }
+
+    const maxIterations = 10;
+    const assignments = new Array(samples.length);
+
+    for (let iter = 0; iter < maxIterations; iter++) {
+      for (let i = 0; i < samples.length; i++) {
+        let bestDist = Infinity;
+        let bestCluster = 0;
+        for (let c = 0; c < centroids.length; c++) {
+          const dr = samples[i][0] - centroids[c][0];
+          const dg = samples[i][1] - centroids[c][1];
+          const db = samples[i][2] - centroids[c][2];
+          const dist = dr * dr + dg * dg + db * db;
+          if (dist < bestDist) {
+            bestDist = dist;
+            bestCluster = c;
+          }
+        }
+        assignments[i] = bestCluster;
+      }
+
+      const sums: Array<[number, number, number, number]> = centroids.map(() => [0, 0, 0, 0]);
+      for (let i = 0; i < samples.length; i++) {
+        const c = assignments[i];
+        sums[c][0] += samples[i][0];
+        sums[c][1] += samples[i][1];
+        sums[c][2] += samples[i][2];
+        sums[c][3] += 1;
+      }
+      for (let c = 0; c < centroids.length; c++) {
+        if (sums[c][3] > 0) {
+          centroids[c][0] = Math.round(sums[c][0] / sums[c][3]);
+          centroids[c][1] = Math.round(sums[c][1] / sums[c][3]);
+          centroids[c][2] = Math.round(sums[c][2] / sums[c][3]);
+        }
+      }
+    }
+
+    const clusterSizes = new Array(centroids.length).fill(0);
+    for (const a of assignments) {
+      clusterSizes[a]++;
+    }
+
+    const indexedClusters = centroids.map((c, i) => ({ color: c, size: clusterSizes[i] }));
+    indexedClusters.sort((a, b) => b.size - a.size);
+
+    const hexColors = indexedClusters.map(({ color }) => {
+      const [r, g, b] = color;
+      return (
+        "#" +
+        r.toString(16).padStart(2, "0") +
+        g.toString(16).padStart(2, "0") +
+        b.toString(16).padStart(2, "0")
+      );
+    });
+
+    return hexColors;
+  },
 };
 
 // --- RPC Interface ---
@@ -3686,6 +4453,10 @@ const noRelayCommands = new Set([
   "exportGltf",
   "renderSpritesheet",
   "renderMultiView",
+  "extractPalette",
+  "analyzeMesh",
+  "bakeNormalMap",
+  "bakeAO",
   "listObjects",
   "getBounds",
 ]);

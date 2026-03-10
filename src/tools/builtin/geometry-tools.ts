@@ -506,4 +506,227 @@ export function registerGeometryTools(server: AtelierMcpServer): void {
       return makeTextResponse({ id: newId, ...(result as object) });
     },
   });
+
+  // --- create_morph_target ---
+  server.registry.register({
+    name: "create_morph_target",
+    description:
+      "Create a morph target (blend shape) on a mesh. Provide vertex deltas to define " +
+      "the target shape. Use set_morph_influence to blend between base and target shapes.",
+    schema: {
+      objectId: z.string().describe("ID of the mesh to add the morph target to"),
+      targetName: z.string().describe("Name for this morph target"),
+      deltas: z
+        .array(
+          z.object({
+            index: z.number().int().min(0).describe("Vertex index"),
+            dx: z.number().describe("X displacement"),
+            dy: z.number().describe("Y displacement"),
+            dz: z.number().describe("Z displacement"),
+          }),
+        )
+        .min(1)
+        .describe("Array of vertex deltas {index, dx, dy, dz}"),
+    },
+    handler: async (ctx) => {
+      const { objectId, targetName, deltas } = ctx.args;
+      const obj = server.scene.get(objectId);
+      if (!obj) {
+        throw new AtelierError(ErrorCode.OBJECT_NOT_FOUND, `Object "${objectId}" not found`);
+      }
+      const result = await server.bridge.execute("createMorphTarget", {
+        objectId,
+        targetName,
+        deltas,
+      });
+      return makeTextResponse(result);
+    },
+  });
+
+  // --- set_morph_influence ---
+  server.registry.register({
+    name: "set_morph_influence",
+    description:
+      "Set the influence (0-1) of a morph target on a mesh. " +
+      "0 = base shape, 1 = fully morphed to target shape.",
+    schema: {
+      objectId: z.string().describe("ID of the mesh"),
+      targetName: z.string().describe("Name of the morph target"),
+      influence: z
+        .number()
+        .min(0)
+        .max(1)
+        .describe("Influence value (0 = base shape, 1 = full morph)"),
+    },
+    handler: async (ctx) => {
+      const { objectId, targetName, influence } = ctx.args;
+      const obj = server.scene.get(objectId);
+      if (!obj) {
+        throw new AtelierError(ErrorCode.OBJECT_NOT_FOUND, `Object "${objectId}" not found`);
+      }
+      const result = await server.bridge.execute("setMorphInfluence", {
+        objectId,
+        targetName,
+        influence,
+      });
+      return makeTextResponse(result);
+    },
+  });
+
+  // --- create_curve ---
+  server.registry.register({
+    name: "create_curve",
+    description:
+      "Create a spline/curve object. Supports CatmullRom (smooth through points) or " +
+      "Bezier (4 control points). Optionally visualize as a tube with a given radius, " +
+      "or as a thin line. Use sample_curve to query positions and curve_to_mesh to convert.",
+    schema: {
+      type: z
+        .enum(["catmullrom", "bezier"])
+        .default("catmullrom")
+        .describe("Curve type"),
+      points: z
+        .array(z.tuple([z.number(), z.number(), z.number()]))
+        .min(2)
+        .describe("Control points [[x,y,z], ...]"),
+      closed: z.boolean().default(false).describe("Whether the curve forms a closed loop"),
+      tension: z
+        .number()
+        .min(0)
+        .max(1)
+        .optional()
+        .describe("Tension for CatmullRom curves (0 = loose, 1 = tight)"),
+      radius: z
+        .number()
+        .min(0)
+        .optional()
+        .describe("If > 0, visualize as a tube with this radius"),
+      tubularSegments: z
+        .number()
+        .int()
+        .min(3)
+        .optional()
+        .describe("Number of segments along the curve"),
+    },
+    handler: async (ctx) => {
+      const { type, points, closed, tension, radius, tubularSegments } = ctx.args;
+      const id = server.scene.generateId("curve");
+      server.scene.create({
+        id,
+        name: id,
+        type: "curve",
+        metadata: { curveType: type, pointCount: points.length, closed },
+      });
+      const result = await server.bridge.execute("createCurve", {
+        id,
+        type,
+        points,
+        closed,
+        tension,
+        radius,
+        tubularSegments,
+      });
+      return makeTextResponse({ id, ...(result as object) });
+    },
+  });
+
+  // --- sample_curve ---
+  server.registry.register({
+    name: "sample_curve",
+    description:
+      "Sample a point and tangent on a curve at parameter t (0-1).",
+    schema: {
+      objectId: z.string().describe("ID of the curve"),
+      t: z.number().min(0).max(1).describe("Parameter along the curve (0 = start, 1 = end)"),
+    },
+    handler: async (ctx) => {
+      const { objectId, t } = ctx.args;
+      const obj = server.scene.get(objectId);
+      if (!obj) {
+        throw new AtelierError(ErrorCode.OBJECT_NOT_FOUND, `Curve "${objectId}" not found`);
+      }
+      const result = await server.bridge.execute("sampleCurve", { id: objectId, t });
+      return makeTextResponse(result);
+    },
+  });
+
+  // --- curve_to_mesh ---
+  server.registry.register({
+    name: "curve_to_mesh",
+    description:
+      "Convert a curve into a solid tube mesh with configurable radius and segments.",
+    schema: {
+      objectId: z.string().describe("ID of the curve to convert"),
+      radius: z.number().positive().default(0.1).describe("Tube radius"),
+      segments: z.number().int().min(3).default(64).describe("Segments along the tube"),
+      radialSegments: z.number().int().min(3).default(8).describe("Segments around circumference"),
+    },
+    handler: async (ctx) => {
+      const { objectId, radius, segments, radialSegments } = ctx.args;
+      const obj = server.scene.get(objectId);
+      if (!obj) {
+        throw new AtelierError(ErrorCode.OBJECT_NOT_FOUND, `Curve "${objectId}" not found`);
+      }
+      const newId = server.scene.generateId("tubemesh");
+      server.scene.create({
+        id: newId,
+        name: newId,
+        type: "mesh",
+        metadata: { fromCurve: objectId, radius },
+      });
+      const result = await server.bridge.execute("curveToMesh", {
+        id: objectId,
+        newId,
+        radius,
+        segments,
+        radialSegments,
+      });
+      return makeTextResponse({ id: newId, ...(result as object) });
+    },
+  });
+
+  // --- create_text ---
+  server.registry.register({
+    name: "create_text",
+    description:
+      "Create 3D text geometry. Loads a default font and creates extruded text.",
+    schema: {
+      text: z.string().min(1).describe("The text string to render"),
+      size: z.number().positive().default(1).describe("Font size"),
+      depth: z.number().positive().default(0.2).describe("Extrusion depth"),
+      bevelEnabled: z.boolean().default(false).describe("Enable bevel on text edges"),
+    },
+    handler: async (ctx) => {
+      const { text, size, depth, bevelEnabled } = ctx.args;
+      const id = server.scene.generateId("text");
+      server.scene.create({
+        id,
+        name: id,
+        type: "text",
+        metadata: { text, size, depth, bevelEnabled },
+      });
+      await server.bridge.execute("createText", { id, text, size, depth, bevelEnabled });
+      return makeTextResponse({ id, text });
+    },
+  });
+
+  // --- analyze_mesh ---
+  server.registry.register({
+    name: "analyze_mesh",
+    description:
+      "Analyze a mesh and return geometry statistics: vertex count, face count, " +
+      "bounding box, surface area, and whether it has normals and UVs.",
+    schema: {
+      objectId: z.string().describe("ID of the mesh to analyze"),
+    },
+    handler: async (ctx) => {
+      const { objectId } = ctx.args;
+      const obj = server.scene.get(objectId);
+      if (!obj) {
+        throw new AtelierError(ErrorCode.OBJECT_NOT_FOUND, `Object "${objectId}" not found`);
+      }
+      const result = await server.bridge.execute("analyzeMesh", { objectId });
+      return makeTextResponse(result);
+    },
+  });
 }

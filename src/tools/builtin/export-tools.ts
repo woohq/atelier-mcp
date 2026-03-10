@@ -2,7 +2,8 @@ import path from "node:path";
 import { writeFile } from "node:fs/promises";
 import { z } from "zod";
 import type { AtelierMcpServer } from "../../server/server.js";
-import { makeTextResponse } from "../response.js";
+import { makeImageResponse, makeTextResponse } from "../response.js";
+import { AtelierError, ErrorCode } from "../../types/errors.js";
 
 interface SpritesheetFrameRect {
   x: number;
@@ -250,6 +251,226 @@ export function registerExportTools(server: AtelierMcpServer): void {
         format,
         sizeBytes: Buffer.byteLength(content, "utf-8"),
       });
+    },
+  });
+
+  // --- render_turnaround ---
+  server.registry.register({
+    name: "render_turnaround",
+    description:
+      "Render the scene from multiple evenly-spaced rotation angles around the Y axis. " +
+      "Returns all rendered images, useful for inspecting a model from all sides.",
+    schema: {
+      count: z
+        .number()
+        .int()
+        .min(2)
+        .max(36)
+        .default(8)
+        .describe("Number of views around the Y axis"),
+      width: z.number().int().min(64).max(4096).default(512).describe("Render width in pixels"),
+      height: z.number().int().min(64).max(4096).default(512).describe("Render height in pixels"),
+    },
+    handler: async (ctx) => {
+      const { count, width, height } = ctx.args;
+
+      await server.bridge.execute("resize", { width, height });
+
+      const images: Array<{ type: "image"; data: string; mimeType: string }> = [];
+      const radius = 5;
+      const elevation = 3;
+
+      for (let i = 0; i < count; i++) {
+        const angle = (Math.PI * 2 * i) / count;
+        const x = radius * Math.cos(angle);
+        const zPos = radius * Math.sin(angle);
+
+        await server.bridge.execute("setCamera", {
+          position: [x, elevation, zPos],
+          lookAt: [0, 0, 0],
+        });
+
+        const base64 = (await server.bridge.execute("renderPreview", {
+          format: "png",
+          quality: 92,
+          transparent: false,
+        })) as string;
+
+        images.push({ type: "image" as const, data: base64, mimeType: "image/png" });
+      }
+
+      return {
+        content: [
+          ...images,
+          {
+            type: "text" as const,
+            text: JSON.stringify({
+              status: "rendered",
+              count,
+              width,
+              height,
+              angles: Array.from({ length: count }, (_, i) => Math.round((360 * i) / count)),
+            }),
+          },
+        ],
+      };
+    },
+  });
+
+  // --- batch_export ---
+  server.registry.register({
+    name: "batch_export",
+    description:
+      "Export multiple objects individually. For each object, hides all others, " +
+      "renders or exports the isolated object, then restores visibility.",
+    schema: {
+      format: z.enum(["glb", "png"]).describe("Export format"),
+      namePrefix: z.string().default("export").describe("Prefix for exported file names"),
+      objectIds: z
+        .array(z.string())
+        .optional()
+        .describe("Specific object IDs to export. If omitted, exports the entire scene."),
+    },
+    handler: async (ctx) => {
+      const { format, namePrefix, objectIds } = ctx.args;
+
+      if (!objectIds || objectIds.length === 0) {
+        if (format === "glb") {
+          const base64 = (await server.bridge.execute("exportGltf", {})) as string;
+          const buffer = Buffer.from(base64, "base64");
+          const outputPath = path.resolve(`${namePrefix}.glb`);
+          await writeFile(outputPath, buffer);
+          return makeTextResponse({
+            status: "exported",
+            items: [{ name: `${namePrefix}.glb`, path: outputPath, sizeBytes: buffer.length }],
+            format,
+          });
+        } else {
+          await server.bridge.execute("resize", { width: 1024, height: 1024 });
+          const base64 = (await server.bridge.execute("renderPreview", {
+            format: "png",
+            quality: 92,
+            transparent: true,
+          })) as string;
+          const buffer = Buffer.from(base64, "base64");
+          const outputPath = path.resolve(`${namePrefix}.png`);
+          await writeFile(outputPath, buffer);
+          return makeTextResponse({
+            status: "exported",
+            items: [{ name: `${namePrefix}.png`, path: outputPath, sizeBytes: buffer.length }],
+            format,
+          });
+        }
+      }
+
+      const allObjects = server.scene.list();
+      const allIds = allObjects.map((o) => o.id);
+      const exported: Array<{ objectId: string; name: string; path: string; sizeBytes: number }> =
+        [];
+
+      for (const objectId of objectIds) {
+        for (const id of allIds) {
+          await server.bridge.execute("setObjectVisibility", {
+            objectId: id,
+            visible: id === objectId,
+          });
+        }
+
+        const itemName = `${namePrefix}_${objectId}`;
+
+        if (format === "glb") {
+          const base64 = (await server.bridge.execute("exportGltf", { objectId })) as string;
+          const buffer = Buffer.from(base64, "base64");
+          const outputPath = path.resolve(`${itemName}.glb`);
+          await writeFile(outputPath, buffer);
+          exported.push({ objectId, name: `${itemName}.glb`, path: outputPath, sizeBytes: buffer.length });
+        } else {
+          await server.bridge.execute("resize", { width: 1024, height: 1024 });
+          const base64 = (await server.bridge.execute("renderPreview", {
+            format: "png",
+            quality: 92,
+            transparent: true,
+          })) as string;
+          const buffer = Buffer.from(base64, "base64");
+          const outputPath = path.resolve(`${itemName}.png`);
+          await writeFile(outputPath, buffer);
+          exported.push({ objectId, name: `${itemName}.png`, path: outputPath, sizeBytes: buffer.length });
+        }
+      }
+
+      for (const id of allIds) {
+        await server.bridge.execute("setObjectVisibility", { objectId: id, visible: true });
+      }
+
+      return makeTextResponse({ status: "exported", items: exported, format, count: exported.length });
+    },
+  });
+
+  // --- bake_normal_map ---
+  server.registry.register({
+    name: "bake_normal_map",
+    description:
+      "Bake a normal map for an object using orthographic MeshNormalMaterial rendering. " +
+      "Returns the normal map as a PNG image.",
+    schema: {
+      objectId: z.string().describe("ID of the object to bake a normal map for"),
+      resolution: z
+        .number()
+        .int()
+        .min(64)
+        .max(2048)
+        .default(512)
+        .describe("Output resolution in pixels (square)"),
+    },
+    handler: async (ctx) => {
+      const { objectId, resolution } = ctx.args;
+      const obj = server.scene.get(objectId);
+      if (!obj) {
+        throw new AtelierError(ErrorCode.OBJECT_NOT_FOUND, `Object "${objectId}" not found`);
+      }
+      const base64 = (await server.bridge.execute("bakeNormalMap", {
+        objectId,
+        resolution,
+      })) as string;
+      return makeImageResponse(base64, "image/png");
+    },
+  });
+
+  // --- bake_ao ---
+  server.registry.register({
+    name: "bake_ao",
+    description:
+      "Bake an ambient occlusion map for an object using multi-sample hemisphere lighting. " +
+      "Returns the AO map as a PNG image.",
+    schema: {
+      objectId: z.string().describe("ID of the object to bake AO for"),
+      resolution: z
+        .number()
+        .int()
+        .min(64)
+        .max(2048)
+        .default(512)
+        .describe("Output resolution in pixels (square)"),
+      samples: z
+        .number()
+        .int()
+        .min(4)
+        .max(128)
+        .default(32)
+        .describe("Number of light direction samples"),
+    },
+    handler: async (ctx) => {
+      const { objectId, resolution, samples } = ctx.args;
+      const obj = server.scene.get(objectId);
+      if (!obj) {
+        throw new AtelierError(ErrorCode.OBJECT_NOT_FOUND, `Object "${objectId}" not found`);
+      }
+      const base64 = (await server.bridge.execute("bakeAO", {
+        objectId,
+        resolution,
+        samples,
+      })) as string;
+      return makeImageResponse(base64, "image/png");
     },
   });
 }

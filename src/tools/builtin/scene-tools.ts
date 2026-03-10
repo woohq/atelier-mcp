@@ -321,6 +321,175 @@ export function registerSceneTools(server: AtelierMcpServer): void {
     },
   });
 
+  // --- set_reference_image ---
+  server.registry.register({
+    name: "set_reference_image",
+    description:
+      "Place a reference image in the scene for visual comparison. " +
+      'Mode "background" creates a full-screen backdrop behind the scene. ' +
+      'Mode "plane" creates a positioned plane with the image texture.',
+    schema: {
+      imageData: z.string().describe("Base64-encoded PNG image data"),
+      position: vec3Schema
+        .optional()
+        .describe('Position [x, y, z] for "plane" mode'),
+      scale: vec3Schema
+        .optional()
+        .describe('Scale [x, y, z] for "plane" mode'),
+      opacity: z
+        .number()
+        .min(0)
+        .max(1)
+        .default(0.5)
+        .describe("Image opacity (0=transparent, 1=opaque)"),
+      mode: z
+        .enum(["background", "plane"])
+        .default("plane")
+        .describe('"background" for a full-screen backdrop, "plane" for a positioned plane'),
+    },
+    handler: async (ctx) => {
+      const { imageData, position, scale, opacity, mode } = ctx.args;
+      const id = server.scene.generateId("refimg");
+      server.scene.create({
+        id,
+        name: id,
+        type: "reference_image",
+        metadata: { mode, opacity },
+      });
+      await server.bridge.execute("setReferenceImage", {
+        id,
+        imageData,
+        position,
+        scale,
+        opacity,
+        mode,
+      });
+      return makeTextResponse({ id, mode, opacity });
+    },
+  });
+
+  // --- add_constraint ---
+  server.registry.register({
+    name: "add_constraint",
+    description:
+      "Add a constraint between two objects. " +
+      "'look_at' makes the source always face the target. " +
+      "'copy_transform' copies the target's transform to the source with an optional offset.",
+    schema: {
+      type: z
+        .enum(["look_at", "copy_transform"])
+        .describe("Constraint type"),
+      sourceId: z.string().describe("ID of the source object (the one being constrained)"),
+      targetId: z.string().describe("ID of the target object (the one being tracked/copied)"),
+      offset: vec3Schema
+        .optional()
+        .describe("Positional offset [x, y, z] for copy_transform"),
+    },
+    handler: async (ctx) => {
+      const { type, sourceId, targetId, offset } = ctx.args;
+      const source = server.scene.get(sourceId);
+      if (!source) {
+        throw new AtelierError(ErrorCode.OBJECT_NOT_FOUND, `Source "${sourceId}" not found`);
+      }
+      const target = server.scene.get(targetId);
+      if (!target) {
+        throw new AtelierError(ErrorCode.OBJECT_NOT_FOUND, `Target "${targetId}" not found`);
+      }
+      const constraintId = server.scene.generateId("constraint");
+      await server.bridge.execute("addConstraint", {
+        id: constraintId,
+        type,
+        sourceId,
+        targetId,
+        offset,
+      });
+      return makeTextResponse({ constraintId, type, sourceId, targetId, offset });
+    },
+  });
+
+  // --- remove_constraint ---
+  server.registry.register({
+    name: "remove_constraint",
+    description: "Remove a constraint by its ID.",
+    schema: {
+      constraintId: z.string().describe("ID of the constraint to remove"),
+    },
+    handler: async (ctx) => {
+      const { constraintId } = ctx.args;
+      await server.bridge.execute("removeConstraint", { id: constraintId });
+      return makeTextResponse({ constraintId, removed: true });
+    },
+  });
+
+  // --- align_objects ---
+  server.registry.register({
+    name: "align_objects",
+    description:
+      "Align multiple objects along an axis. " +
+      "'min' aligns to the smallest edge, 'center' to the average, 'max' to the largest edge.",
+    schema: {
+      objectIds: z
+        .array(z.string())
+        .min(2)
+        .describe("IDs of objects to align"),
+      axis: z.enum(["x", "y", "z"]).describe("Axis to align on"),
+      alignment: z.enum(["min", "center", "max"]).describe("Alignment mode"),
+    },
+    handler: async (ctx) => {
+      const { objectIds, axis, alignment } = ctx.args;
+      for (const oid of objectIds) {
+        if (!server.scene.get(oid)) {
+          throw new AtelierError(ErrorCode.OBJECT_NOT_FOUND, `Object "${oid}" not found`);
+        }
+      }
+      const result = await server.bridge.execute("alignObjects", { objectIds, axis, alignment });
+      return makeTextResponse(result);
+    },
+  });
+
+  // --- distribute_objects ---
+  server.registry.register({
+    name: "distribute_objects",
+    description:
+      "Evenly distribute objects along an axis between the min and max positions.",
+    schema: {
+      objectIds: z
+        .array(z.string())
+        .min(3)
+        .describe("IDs of objects to distribute"),
+      axis: z.enum(["x", "y", "z"]).describe("Axis to distribute along"),
+    },
+    handler: async (ctx) => {
+      const { objectIds, axis } = ctx.args;
+      for (const oid of objectIds) {
+        if (!server.scene.get(oid)) {
+          throw new AtelierError(ErrorCode.OBJECT_NOT_FOUND, `Object "${oid}" not found`);
+        }
+      }
+      const result = await server.bridge.execute("distributeObjects", { objectIds, axis });
+      return makeTextResponse(result);
+    },
+  });
+
+  // --- snap_to_ground ---
+  server.registry.register({
+    name: "snap_to_ground",
+    description:
+      "Snap an object to the ground plane (y=0) so its bounding box bottom touches y=0.",
+    schema: {
+      objectId: z.string().describe("ID of the object to snap"),
+    },
+    handler: async (ctx) => {
+      const { objectId } = ctx.args;
+      const obj = server.scene.get(objectId);
+      if (!obj) {
+        throw new AtelierError(ErrorCode.OBJECT_NOT_FOUND, `Object "${objectId}" not found`);
+      }
+      const result = await server.bridge.execute("snapToGround", { objectId });
+      return makeTextResponse(result);
+    },
+  });
+
   // --- render_multi_view ---
   server.registry.register({
     name: "render_multi_view",
