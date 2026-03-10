@@ -3,6 +3,7 @@ import { registerAestheticTools } from "./aesthetic-tools.js";
 import { registerAnimationTools } from "./animation-tools.js";
 import { registerCanvasTools } from "./canvas-tools.js";
 import { registerExportTools } from "./export-tools.js";
+import { registerImportTools } from "./import-tools.js";
 import { registerGeometryTools } from "./geometry-tools.js";
 import { registerMaterialTools } from "./material-tools.js";
 import { registerModelingTools } from "./modeling-tools.js";
@@ -29,4 +30,5 @@ export function registerBuiltinTools(server: AtelierMcpServer): void {
   registerProceduralTools(server);
   registerStyleTools(server);
   registerVariationTools(server);
+  registerImportTools(server);
 }

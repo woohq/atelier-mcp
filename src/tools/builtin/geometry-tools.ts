@@ -115,7 +115,7 @@ export function registerGeometryTools(server: AtelierMcpServer): void {
     name: "boolean_op",
     description:
       "Perform a boolean/CSG operation between two meshes: union, subtract, or intersect. " +
-      "NOTE: Not yet implemented — returns a placeholder. Will be backed by three-bvh-csg.",
+      "The target mesh is modified in place and the tool mesh is removed from the scene.",
     schema: {
       targetId: z.string().describe("ID of the target (base) mesh"),
       toolId: z.string().describe("ID of the tool (cutter) mesh"),
@@ -136,9 +136,12 @@ export function registerGeometryTools(server: AtelierMcpServer): void {
         toolId,
         operation,
       });
+      // Remove tool from scene graph
+      server.scene.remove(toolId);
       return makeTextResponse({
-        status: "not_yet_implemented",
-        message: `Boolean ${operation} between "${targetId}" and "${toolId}" is stubbed. CSG library integration pending.`,
+        targetId,
+        operation,
+        toolRemoved: toolId,
         ...(result as object),
       });
     },
@@ -173,6 +176,58 @@ export function registerGeometryTools(server: AtelierMcpServer): void {
       });
       await server.bridge.execute("extrude", { id, points, depth, position, color });
       return makeTextResponse({ id, pointCount: points.length, depth });
+    },
+  });
+
+  // --- extrude_along_path ---
+  server.registry.register({
+    name: "extrude_along_path",
+    description:
+      "Extrude a 2D profile along a 3D spline path. Creates organic shapes like " +
+      "tentacles, horns, pipes with variable cross-section. Supports twist and scale variation.",
+    schema: {
+      profile: z
+        .array(z.tuple([z.number(), z.number()]))
+        .min(3)
+        .describe("2D profile points [[x,y], ...] defining the cross-section shape"),
+      path: z
+        .array(z.tuple([z.number(), z.number(), z.number()]))
+        .min(2)
+        .describe("3D path points [[x,y,z], ...] the profile is extruded along"),
+      segments: z.number().int().min(2).default(64).describe("Number of segments along the path"),
+      closed: z.boolean().default(false).describe("Whether the path forms a closed loop"),
+      scalePath: z
+        .array(z.number().positive())
+        .optional()
+        .describe("Scale values along the path (interpolated). E.g. [1, 0.5] tapers to half."),
+      twistAngle: z
+        .number()
+        .optional()
+        .describe("Total twist angle in radians applied along the path"),
+      color: z.union([z.string(), z.number().int()]).optional().describe("Color"),
+      position: vec3Schema.optional().describe("Position [x,y,z]"),
+    },
+    handler: async (ctx) => {
+      const { profile, path, segments, closed, scalePath, twistAngle, color, position } = ctx.args;
+      const id = server.scene.generateId("pathextrude");
+      server.scene.create({
+        id,
+        name: id,
+        type: "pathextrude",
+        metadata: { profilePoints: profile.length, pathPoints: path.length },
+      });
+      const result = await server.bridge.execute("extrudeAlongPath", {
+        id,
+        profile,
+        path,
+        segments,
+        closed,
+        scalePath,
+        twistAngle,
+        color,
+        position,
+      });
+      return makeTextResponse({ id, ...(result as object) });
     },
   });
 
@@ -244,6 +299,211 @@ export function registerGeometryTools(server: AtelierMcpServer): void {
         levels,
         ...(result as object),
       });
+    },
+  });
+
+  // --- get_vertices ---
+  server.registry.register({
+    name: "get_vertices",
+    description:
+      "Read vertex positions from a mesh. Returns an array of [x,y,z] positions. " +
+      "Use start/count for pagination on large meshes.",
+    schema: {
+      objectId: z.string().describe("ID of the mesh"),
+      start: z.number().int().min(0).optional().describe("Start vertex index (default 0)"),
+      count: z.number().int().min(1).optional().describe("Number of vertices to read (default all)"),
+    },
+    handler: async (ctx) => {
+      const { objectId, start, count } = ctx.args;
+      const obj = server.scene.get(objectId);
+      if (!obj)
+        throw new AtelierError(ErrorCode.OBJECT_NOT_FOUND, `Object "${objectId}" not found`);
+      const result = await server.bridge.execute("getVertices", { objectId, start, count });
+      return makeTextResponse(result);
+    },
+  });
+
+  // --- set_vertices ---
+  server.registry.register({
+    name: "set_vertices",
+    description:
+      "Write vertex positions to a mesh. Provide a flat array of positions [x,y,z,...] " +
+      "and optionally an indices array to update specific vertices only.",
+    schema: {
+      objectId: z.string().describe("ID of the mesh"),
+      positions: z.array(z.number()).describe("Flat array of positions [x,y,z, x,y,z, ...]"),
+      indices: z
+        .array(z.number().int().min(0))
+        .optional()
+        .describe("Vertex indices to update (partial update)"),
+    },
+    handler: async (ctx) => {
+      const { objectId, positions, indices } = ctx.args;
+      const obj = server.scene.get(objectId);
+      if (!obj)
+        throw new AtelierError(ErrorCode.OBJECT_NOT_FOUND, `Object "${objectId}" not found`);
+      const result = await server.bridge.execute("setVertices", { objectId, positions, indices });
+      return makeTextResponse(result);
+    },
+  });
+
+  // --- push_pull ---
+  server.registry.register({
+    name: "push_pull",
+    description:
+      "Move vertices along their normals (inflate/deflate). Select vertices by: " +
+      "'all', specific indices, sphere region (with falloff), or box region.",
+    schema: {
+      objectId: z.string().describe("ID of the mesh"),
+      distance: z.number().describe("Distance to push (positive) or pull (negative) along normals"),
+      selection: z
+        .enum(["all", "indices", "sphere", "box"])
+        .default("all")
+        .describe("Selection mode"),
+      indices: z
+        .array(z.number().int().min(0))
+        .optional()
+        .describe("Vertex indices (when selection='indices')"),
+      sphere: z
+        .object({
+          center: z.tuple([z.number(), z.number(), z.number()]),
+          radius: z.number().positive(),
+        })
+        .optional()
+        .describe("Sphere selection region"),
+      box: z
+        .object({
+          min: z.tuple([z.number(), z.number(), z.number()]),
+          max: z.tuple([z.number(), z.number(), z.number()]),
+        })
+        .optional()
+        .describe("Box selection region"),
+      falloff: z
+        .enum(["linear", "smooth", "sharp"])
+        .default("linear")
+        .describe("Falloff curve for sphere selection"),
+    },
+    handler: async (ctx) => {
+      const { objectId, ...rest } = ctx.args;
+      const obj = server.scene.get(objectId);
+      if (!obj)
+        throw new AtelierError(ErrorCode.OBJECT_NOT_FOUND, `Object "${objectId}" not found`);
+      const result = await server.bridge.execute("pushPull", { objectId, ...rest });
+      return makeTextResponse(result);
+    },
+  });
+
+  // --- smooth_merge ---
+  server.registry.register({
+    name: "smooth_merge",
+    description:
+      "Merge two meshes with Laplacian smoothing near the intersection zone. " +
+      "Fast approximation of organic blending — good for joining body parts, terrain features.",
+    schema: {
+      objectIdA: z.string().describe("First mesh ID"),
+      objectIdB: z.string().describe("Second mesh ID"),
+      smoothRadius: z
+        .number()
+        .positive()
+        .default(0.5)
+        .describe("Radius of smoothing zone around intersection"),
+      iterations: z
+        .number()
+        .int()
+        .min(1)
+        .max(20)
+        .default(3)
+        .describe("Smoothing iterations"),
+      removeOriginals: z
+        .boolean()
+        .default(true)
+        .describe("Remove original meshes after merge"),
+    },
+    handler: async (ctx) => {
+      const { objectIdA, objectIdB, smoothRadius, iterations, removeOriginals } = ctx.args;
+      for (const oid of [objectIdA, objectIdB]) {
+        if (!server.scene.get(oid))
+          throw new AtelierError(ErrorCode.OBJECT_NOT_FOUND, `Object "${oid}" not found`);
+      }
+      const newId = server.scene.generateId("smoothmerge");
+      server.scene.create({
+        id: newId,
+        name: newId,
+        type: "mesh",
+        metadata: { smoothMerge: true },
+      });
+      const result = await server.bridge.execute("smoothMerge", {
+        objectIdA,
+        objectIdB,
+        newId,
+        smoothRadius,
+        iterations,
+        removeOriginals,
+      });
+      if (removeOriginals) {
+        server.scene.remove(objectIdA);
+        server.scene.remove(objectIdB);
+      }
+      return makeTextResponse({ id: newId, ...(result as object) });
+    },
+  });
+
+  // --- smooth_boolean ---
+  server.registry.register({
+    name: "smooth_boolean",
+    description:
+      "SDF-based boolean with smooth blending. Creates organic merged shapes " +
+      "using marching cubes surface extraction. Slower but produces smooth, organic results.",
+    schema: {
+      objectIdA: z.string().describe("First mesh ID"),
+      objectIdB: z.string().describe("Second mesh ID"),
+      operation: z
+        .enum(["union", "subtract", "intersect"])
+        .default("union")
+        .describe("Boolean operation"),
+      smoothness: z
+        .number()
+        .min(0)
+        .max(2)
+        .default(0.3)
+        .describe("Blend smoothness (higher = smoother blend)"),
+      resolution: z
+        .number()
+        .int()
+        .min(16)
+        .max(128)
+        .default(32)
+        .describe("Grid resolution for SDF evaluation"),
+      removeOriginals: z.boolean().default(true).describe("Remove original meshes"),
+    },
+    handler: async (ctx) => {
+      const { objectIdA, objectIdB, operation, smoothness, resolution, removeOriginals } =
+        ctx.args;
+      for (const oid of [objectIdA, objectIdB]) {
+        if (!server.scene.get(oid))
+          throw new AtelierError(ErrorCode.OBJECT_NOT_FOUND, `Object "${oid}" not found`);
+      }
+      const newId = server.scene.generateId("sdfblend");
+      server.scene.create({
+        id: newId,
+        name: newId,
+        type: "mesh",
+        metadata: { sdfBlend: true, operation },
+      });
+      const result = await server.bridge.execute("smoothBoolean", {
+        objectIdA,
+        objectIdB,
+        newId,
+        operation,
+        smoothness,
+        resolution,
+        removeOriginals,
+      });
+      if (removeOriginals) {
+        server.scene.remove(objectIdA);
+        server.scene.remove(objectIdB);
+      }
+      return makeTextResponse({ id: newId, ...(result as object) });
     },
   });
 }

@@ -6,6 +6,10 @@ import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
 import { ShaderPass } from "three/addons/postprocessing/ShaderPass.js";
 import { OutputPass } from "three/addons/postprocessing/OutputPass.js";
 import { mergeGeometries } from "three/addons/utils/BufferGeometryUtils.js";
+import { Evaluator, Brush, ADDITION, SUBTRACTION, INTERSECTION } from "three-bvh-csg";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { OBJLoader } from "three/addons/loaders/OBJLoader.js";
+import { STLLoader } from "three/addons/loaders/STLLoader.js";
 import { initUI, updateUI } from "./ui.js";
 
 // --- Three.js Setup ---
@@ -696,14 +700,379 @@ const commands: Record<string, CommandHandler> = {
   },
 
   booleanOp(params) {
-    // CSG not yet implemented — stub that returns a message
     const target = objects.get(params.targetId);
     const tool = objects.get(params.toolId);
-    if (!target) throw new Error(`Object "${params.targetId}" not found`);
-    if (!tool) throw new Error(`Object "${params.toolId}" not found`);
+    if (!target || !(target instanceof THREE.Mesh))
+      throw new Error(`Mesh "${params.targetId}" not found`);
+    if (!tool || !(tool instanceof THREE.Mesh))
+      throw new Error(`Mesh "${params.toolId}" not found`);
+
+    const evaluator = new Evaluator();
+    const brushA = new Brush(target.geometry.clone(), target.material as THREE.Material);
+    brushA.position.copy(target.position);
+    brushA.rotation.copy(target.rotation);
+    brushA.scale.copy(target.scale);
+    brushA.updateMatrixWorld(true);
+
+    const brushB = new Brush(tool.geometry.clone(), tool.material as THREE.Material);
+    brushB.position.copy(tool.position);
+    brushB.rotation.copy(tool.rotation);
+    brushB.scale.copy(tool.scale);
+    brushB.updateMatrixWorld(true);
+
+    let resultBrush: Brush;
+    const op = params.operation;
+    if (op === "subtract") {
+      resultBrush = evaluator.evaluate(brushA, brushB, SUBTRACTION);
+    } else if (op === "intersect") {
+      resultBrush = evaluator.evaluate(brushA, brushB, INTERSECTION);
+    } else {
+      resultBrush = evaluator.evaluate(brushA, brushB, ADDITION);
+    }
+
+    const newGeo = resultBrush.geometry;
+    newGeo.computeVertexNormals();
+    target.geometry.dispose();
+    target.geometry = newGeo;
+    target.position.set(0, 0, 0);
+    target.rotation.set(0, 0, 0);
+    target.scale.set(1, 1, 1);
+
+    tool.removeFromParent();
+    if (tool.geometry) tool.geometry.dispose();
+    if (tool.material instanceof THREE.Material) tool.material.dispose();
+    objects.delete(params.toolId);
+
     return {
-      status: "not_yet_implemented",
-      message: `Boolean ${params.operation} between "${params.targetId}" and "${params.toolId}" requires CSG library. Stub only.`,
+      targetId: params.targetId,
+      operation: params.operation,
+      vertexCount: newGeo.getAttribute("position").count,
+    };
+  },
+
+  smoothMerge(params) {
+    const objA = objects.get(params.objectIdA);
+    const objB = objects.get(params.objectIdB);
+    if (!objA || !(objA instanceof THREE.Mesh))
+      throw new Error(`Mesh "${params.objectIdA}" not found`);
+    if (!objB || !(objB instanceof THREE.Mesh))
+      throw new Error(`Mesh "${params.objectIdB}" not found`);
+
+    // Clone and apply world transforms
+    const geoA = objA.geometry.clone();
+    geoA.applyMatrix4(objA.matrixWorld);
+    const geoB = objB.geometry.clone();
+    geoB.applyMatrix4(objB.matrixWorld);
+
+    // Merge geometries
+    const merged = mergeGeometries([geoA, geoB], false);
+    if (!merged) throw new Error("Failed to merge geometries");
+
+    // Laplacian smoothing near intersection region
+    const posAttr = merged.getAttribute("position");
+    const smoothRadius = params.smoothRadius ?? 0.5;
+    const iterations = params.iterations ?? 3;
+
+    // Find vertices near the intersection (close to both meshes' bounding boxes overlap)
+    const bbA = new THREE.Box3().setFromBufferAttribute(geoA.getAttribute("position"));
+    const bbB = new THREE.Box3().setFromBufferAttribute(geoB.getAttribute("position"));
+    const overlap = new THREE.Box3();
+    overlap.copy(bbA).intersect(bbB);
+    overlap.expandByScalar(smoothRadius);
+
+    // Build adjacency
+    if (!merged.index) {
+      const idx: number[] = [];
+      for (let i = 0; i < posAttr.count; i++) idx.push(i);
+      merged.setIndex(idx);
+    }
+    const index = merged.index!;
+
+    const neighbors: Set<number>[] = Array.from({ length: posAttr.count }, () => new Set());
+    for (let t = 0; t < index.count / 3; t++) {
+      const a = index.getX(t * 3),
+        b = index.getX(t * 3 + 1),
+        c = index.getX(t * 3 + 2);
+      neighbors[a].add(b);
+      neighbors[a].add(c);
+      neighbors[b].add(a);
+      neighbors[b].add(c);
+      neighbors[c].add(a);
+      neighbors[c].add(b);
+    }
+
+    // Identify vertices in the overlap zone
+    const inZone: boolean[] = new Array(posAttr.count).fill(false);
+    const v = new THREE.Vector3();
+    for (let i = 0; i < posAttr.count; i++) {
+      v.set(posAttr.getX(i), posAttr.getY(i), posAttr.getZ(i));
+      if (overlap.containsPoint(v)) inZone[i] = true;
+    }
+
+    // Laplacian smooth only vertices in zone
+    for (let iter = 0; iter < iterations; iter++) {
+      const newPos = new Float32Array(posAttr.count * 3);
+      for (let i = 0; i < posAttr.count; i++) {
+        if (inZone[i] && neighbors[i].size > 0) {
+          let sx = 0,
+            sy = 0,
+            sz = 0;
+          for (const n of neighbors[i]) {
+            sx += posAttr.getX(n);
+            sy += posAttr.getY(n);
+            sz += posAttr.getZ(n);
+          }
+          const count = neighbors[i].size;
+          newPos[i * 3] = sx / count;
+          newPos[i * 3 + 1] = sy / count;
+          newPos[i * 3 + 2] = sz / count;
+        } else {
+          newPos[i * 3] = posAttr.getX(i);
+          newPos[i * 3 + 1] = posAttr.getY(i);
+          newPos[i * 3 + 2] = posAttr.getZ(i);
+        }
+      }
+      for (let i = 0; i < posAttr.count; i++) {
+        posAttr.setXYZ(i, newPos[i * 3], newPos[i * 3 + 1], newPos[i * 3 + 2]);
+      }
+    }
+    posAttr.needsUpdate = true;
+    merged.computeVertexNormals();
+
+    const material =
+      objA.material instanceof THREE.Material
+        ? objA.material.clone()
+        : new THREE.MeshStandardMaterial();
+    const mesh = new THREE.Mesh(merged, material);
+    mesh.name = params.newId;
+    scene.add(mesh);
+    objects.set(params.newId, mesh);
+
+    // Remove originals if requested
+    if (params.removeOriginals) {
+      for (const oid of [params.objectIdA, params.objectIdB]) {
+        const o = objects.get(oid);
+        if (o) {
+          o.removeFromParent();
+          if (o instanceof THREE.Mesh) {
+            o.geometry.dispose();
+            if (o.material instanceof THREE.Material) o.material.dispose();
+          }
+          objects.delete(oid);
+        }
+      }
+    }
+
+    return { id: params.newId, vertexCount: posAttr.count };
+  },
+
+  smoothBoolean(params) {
+    const objA = objects.get(params.objectIdA);
+    const objB = objects.get(params.objectIdB);
+    if (!objA || !(objA instanceof THREE.Mesh))
+      throw new Error(`Mesh "${params.objectIdA}" not found`);
+    if (!objB || !(objB instanceof THREE.Mesh))
+      throw new Error(`Mesh "${params.objectIdB}" not found`);
+
+    const resolution = Math.min(params.resolution ?? 32, 128);
+    const smoothness = params.smoothness ?? 0.3;
+    const operation = params.operation ?? "union";
+
+    // Compute combined bounding box
+    const bbA = new THREE.Box3().setFromObject(objA);
+    const bbB = new THREE.Box3().setFromObject(objB);
+    const bb = new THREE.Box3().copy(bbA).union(bbB);
+    bb.expandByScalar(smoothness * 2);
+
+    const size = new THREE.Vector3();
+    bb.getSize(size);
+    const step = Math.max(size.x, size.y, size.z) / resolution;
+
+    const nx = Math.ceil(size.x / step) + 1;
+    const ny = Math.ceil(size.y / step) + 1;
+    const nz = Math.ceil(size.z / step) + 1;
+
+    // Pre-compute simple distance field using bounding sphere approximation
+    const centerA = new THREE.Vector3();
+    bbA.getCenter(centerA);
+    const centerB = new THREE.Vector3();
+    bbB.getCenter(centerB);
+    const sizeA = new THREE.Vector3();
+    bbA.getSize(sizeA);
+    const sizeB = new THREE.Vector3();
+    bbB.getSize(sizeB);
+    const radiusA = sizeA.length() / 2;
+    const radiusB = sizeB.length() / 2;
+
+    // Simple SDF approximation: signed distance to mesh surface
+    function sdfSphere(
+      p: THREE.Vector3,
+      center: THREE.Vector3,
+      radius: number,
+    ): number {
+      return p.distanceTo(center) - radius;
+    }
+
+    // Smooth min for union
+    function smin(a: number, b: number, k: number): number {
+      const h = Math.max(k - Math.abs(a - b), 0) / k;
+      return Math.min(a, b) - h * h * k * 0.25;
+    }
+
+    // Evaluate SDF at grid points
+    const field = new Float32Array(nx * ny * nz);
+    const p = new THREE.Vector3();
+
+    for (let iz = 0; iz < nz; iz++) {
+      for (let iy = 0; iy < ny; iy++) {
+        for (let ix = 0; ix < nx; ix++) {
+          p.set(
+            bb.min.x + ix * step,
+            bb.min.y + iy * step,
+            bb.min.z + iz * step,
+          );
+          const dA = sdfSphere(p, centerA, radiusA);
+          const dB = sdfSphere(p, centerB, radiusB);
+
+          let d: number;
+          if (operation === "union") d = smin(dA, dB, smoothness);
+          else if (operation === "subtract")
+            d = Math.max(dA, -smin(-dA, dB, smoothness));
+          else d = smin(Math.max(dA, dB), Math.min(dA, dB), smoothness); // intersect
+
+          field[iz * ny * nx + iy * nx + ix] = d;
+        }
+      }
+    }
+
+    // Marching cubes
+    const sdfVertices: number[] = [];
+    const sdfTriangles: number[] = [];
+
+    function getField(ix: number, iy: number, iz: number): number {
+      return field[iz * ny * nx + iy * nx + ix];
+    }
+
+    function interpVertex(
+      x1: number, y1: number, z1: number, v1: number,
+      x2: number, y2: number, z2: number, v2: number,
+    ): number {
+      if (Math.abs(v1) < 0.00001) {
+        sdfVertices.push(x1, y1, z1);
+        return sdfVertices.length / 3 - 1;
+      }
+      if (Math.abs(v2) < 0.00001) {
+        sdfVertices.push(x2, y2, z2);
+        return sdfVertices.length / 3 - 1;
+      }
+      const t = -v1 / (v2 - v1);
+      sdfVertices.push(x1 + t * (x2 - x1), y1 + t * (y2 - y1), z1 + t * (z2 - z1));
+      return sdfVertices.length / 3 - 1;
+    }
+
+    // Simplified marching cubes - process each cell
+    for (let iz = 0; iz < nz - 1; iz++) {
+      for (let iy = 0; iy < ny - 1; iy++) {
+        for (let ix = 0; ix < nx - 1; ix++) {
+          const x = bb.min.x + ix * step;
+          const y = bb.min.y + iy * step;
+          const z = bb.min.z + iz * step;
+
+          const mcv = [
+            getField(ix, iy, iz),
+            getField(ix + 1, iy, iz),
+            getField(ix + 1, iy + 1, iz),
+            getField(ix, iy + 1, iz),
+            getField(ix, iy, iz + 1),
+            getField(ix + 1, iy, iz + 1),
+            getField(ix + 1, iy + 1, iz + 1),
+            getField(ix, iy + 1, iz + 1),
+          ];
+
+          // Determine inside/outside for each corner
+          let cubeIndex = 0;
+          for (let c = 0; c < 8; c++) {
+            if (mcv[c] < 0) cubeIndex |= 1 << c;
+          }
+          if (cubeIndex === 0 || cubeIndex === 255) continue;
+
+          const corners = [
+            [x, y, z],
+            [x + step, y, z],
+            [x + step, y + step, z],
+            [x, y + step, z],
+            [x, y, z + step],
+            [x + step, y, z + step],
+            [x + step, y + step, z + step],
+            [x, y + step, z + step],
+          ];
+
+          // Check each of 12 edges
+          const edges: [number, number][] = [
+            [0, 1], [1, 2], [2, 3], [3, 0],
+            [4, 5], [5, 6], [6, 7], [7, 4],
+            [0, 4], [1, 5], [2, 6], [3, 7],
+          ];
+
+          const edgeVerts: (number | null)[] = new Array(12).fill(null);
+          for (let e = 0; e < 12; e++) {
+            const [ea, eb] = edges[e];
+            if (mcv[ea] < 0 !== mcv[eb] < 0) {
+              edgeVerts[e] = interpVertex(
+                corners[ea][0], corners[ea][1], corners[ea][2], mcv[ea],
+                corners[eb][0], corners[eb][1], corners[eb][2], mcv[eb],
+              );
+            }
+          }
+
+          // Simple triangulation: connect edge vertices that form the isosurface
+          const activeEdges = edgeVerts.filter((e): e is number => e !== null);
+          if (activeEdges.length >= 3) {
+            for (let t = 1; t < activeEdges.length - 1; t++) {
+              sdfTriangles.push(activeEdges[0], activeEdges[t], activeEdges[t + 1]);
+            }
+          }
+        }
+      }
+    }
+
+    const sdfGeometry = new THREE.BufferGeometry();
+    sdfGeometry.setAttribute(
+      "position",
+      new THREE.BufferAttribute(new Float32Array(sdfVertices), 3),
+    );
+    sdfGeometry.setIndex(sdfTriangles);
+    sdfGeometry.computeVertexNormals();
+
+    const material =
+      objA.material instanceof THREE.Material
+        ? objA.material.clone()
+        : new THREE.MeshStandardMaterial({ color: 0xcccccc });
+    const sdfMesh = new THREE.Mesh(sdfGeometry, material);
+    sdfMesh.name = params.newId;
+    scene.add(sdfMesh);
+    objects.set(params.newId, sdfMesh);
+
+    // Remove originals if requested
+    if (params.removeOriginals) {
+      for (const oid of [params.objectIdA, params.objectIdB]) {
+        const o = objects.get(oid);
+        if (o) {
+          o.removeFromParent();
+          if (o instanceof THREE.Mesh) {
+            o.geometry.dispose();
+            if (o.material instanceof THREE.Material) o.material.dispose();
+          }
+          objects.delete(oid);
+        }
+      }
+    }
+
+    return {
+      id: params.newId,
+      vertexCount: sdfVertices.length / 3,
+      faceCount: sdfTriangles.length / 3,
+      resolution,
     };
   },
 
@@ -732,6 +1101,100 @@ const commands: Record<string, CommandHandler> = {
     scene.add(mesh);
     objects.set(params.id, mesh);
     return { id: params.id };
+  },
+
+  extrudeAlongPath(params) {
+    // 2D profile points
+    const profilePts: [number, number][] = params.profile;
+    const shape = new THREE.Shape();
+    shape.moveTo(profilePts[0][0], profilePts[0][1]);
+    for (let i = 1; i < profilePts.length; i++) {
+      shape.lineTo(profilePts[i][0], profilePts[i][1]);
+    }
+    shape.closePath();
+
+    // 3D path points
+    const pathPoints = (params.path as number[][]).map(
+      (pt: number[]) => new THREE.Vector3(pt[0], pt[1], pt[2]),
+    );
+    const curve = new THREE.CatmullRomCurve3(pathPoints, params.closed ?? false);
+
+    const segments = params.segments ?? 64;
+    const frames = curve.computeFrenetFrames(segments, params.closed ?? false);
+    const spacedPoints = curve.getSpacedPoints(segments);
+
+    // Build geometry by sweeping profile along path
+    const epVertices: number[] = [];
+    const epIndices: number[] = [];
+    const profileResolution = profilePts.length;
+
+    for (let i = 0; i <= segments; i++) {
+      const normal = frames.normals[i];
+      const binormal = frames.binormals[i];
+      const point = spacedPoints[i];
+
+      // Scale profile based on scalePath parameter
+      let epScale = 1;
+      if (params.scalePath && params.scalePath.length > 0) {
+        const t = i / segments;
+        const scaleIdx = t * (params.scalePath.length - 1);
+        const sIdx = Math.floor(scaleIdx);
+        const sFrac = scaleIdx - sIdx;
+        const s0 = params.scalePath[Math.min(sIdx, params.scalePath.length - 1)];
+        const s1 = params.scalePath[Math.min(sIdx + 1, params.scalePath.length - 1)];
+        epScale = s0 + (s1 - s0) * sFrac;
+      }
+
+      // Apply twist
+      let twistAngle = 0;
+      if (params.twistAngle) {
+        twistAngle = (params.twistAngle * i) / segments;
+      }
+      const cosT = Math.cos(twistAngle);
+      const sinT = Math.sin(twistAngle);
+
+      for (let j = 0; j < profileResolution; j++) {
+        const px = profilePts[j][0] * epScale;
+        const py = profilePts[j][1] * epScale;
+
+        // Rotate profile point by twist angle
+        const rpx = px * cosT - py * sinT;
+        const rpy = px * sinT + py * cosT;
+
+        // Transform to world space using Frenet frame
+        const vx = point.x + rpx * normal.x + rpy * binormal.x;
+        const vy = point.y + rpx * normal.y + rpy * binormal.y;
+        const vz = point.z + rpx * normal.z + rpy * binormal.z;
+        epVertices.push(vx, vy, vz);
+      }
+    }
+
+    // Build triangle indices
+    for (let i = 0; i < segments; i++) {
+      for (let j = 0; j < profileResolution; j++) {
+        const a = i * profileResolution + j;
+        const b = i * profileResolution + ((j + 1) % profileResolution);
+        const c = (i + 1) * profileResolution + ((j + 1) % profileResolution);
+        const d = (i + 1) * profileResolution + j;
+        epIndices.push(a, b, d);
+        epIndices.push(b, c, d);
+      }
+    }
+
+    const epGeometry = new THREE.BufferGeometry();
+    epGeometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(epVertices), 3));
+    epGeometry.setIndex(epIndices);
+    epGeometry.computeVertexNormals();
+
+    const epMaterial = new THREE.MeshStandardMaterial({ color: params.color ?? 0xcccccc });
+    const epMesh = new THREE.Mesh(epGeometry, epMaterial);
+    epMesh.name = params.id;
+    if (params.position) {
+      epMesh.position.set(params.position[0], params.position[1], params.position[2]);
+    }
+    scene.add(epMesh);
+    objects.set(params.id, epMesh);
+    return { id: params.id, vertexCount: epVertices.length / 3, faceCount: epIndices.length / 3 };
   },
 
   deform(params) {
@@ -968,6 +1431,137 @@ const commands: Record<string, CommandHandler> = {
       vertexCount: geometry.getAttribute("position").count,
       faceCount: geometry.index ? geometry.index.count / 3 : 0,
     };
+  },
+
+  getVertices(params) {
+    const obj = objects.get(params.objectId);
+    if (!obj || !(obj instanceof THREE.Mesh)) throw new Error("Mesh not found");
+    const posAttr = obj.geometry.getAttribute("position");
+    const start = params.start ?? 0;
+    const count = params.count ?? posAttr.count;
+    const end = Math.min(start + count, posAttr.count);
+    const gvVertices: number[][] = [];
+    for (let i = start; i < end; i++) {
+      gvVertices.push([posAttr.getX(i), posAttr.getY(i), posAttr.getZ(i)]);
+    }
+    return {
+      objectId: params.objectId,
+      totalVertices: posAttr.count,
+      start,
+      count: gvVertices.length,
+      vertices: gvVertices,
+    };
+  },
+
+  setVertices(params) {
+    const obj = objects.get(params.objectId);
+    if (!obj || !(obj instanceof THREE.Mesh)) throw new Error("Mesh not found");
+    const posAttr = obj.geometry.getAttribute("position");
+    const positions: number[] = params.positions;
+    const indices: number[] | undefined = params.indices;
+
+    if (indices) {
+      // Partial update — set specific vertex indices
+      for (let i = 0; i < indices.length; i++) {
+        const idx = indices[i];
+        if (idx >= 0 && idx < posAttr.count) {
+          posAttr.setXYZ(idx, positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2]);
+        }
+      }
+    } else {
+      // Full update — replace all positions
+      const svCount = Math.min(positions.length / 3, posAttr.count);
+      for (let i = 0; i < svCount; i++) {
+        posAttr.setXYZ(i, positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2]);
+      }
+    }
+    posAttr.needsUpdate = true;
+    obj.geometry.computeVertexNormals();
+    return { objectId: params.objectId, verticesModified: indices ? indices.length : posAttr.count };
+  },
+
+  pushPull(params) {
+    const obj = objects.get(params.objectId);
+    if (!obj || !(obj instanceof THREE.Mesh)) throw new Error("Mesh not found");
+    const ppGeometry = obj.geometry;
+    const posAttr = ppGeometry.getAttribute("position");
+    const normalAttr = ppGeometry.getAttribute("normal");
+    if (!normalAttr) {
+      ppGeometry.computeVertexNormals();
+    }
+    const normals = ppGeometry.getAttribute("normal");
+
+    const distance = params.distance ?? 0.1;
+    const selection = params.selection ?? "all";
+    const falloff = params.falloff ?? "linear";
+
+    // Determine which vertices to affect
+    const affected: { index: number; weight: number }[] = [];
+
+    if (selection === "all") {
+      for (let i = 0; i < posAttr.count; i++) {
+        affected.push({ index: i, weight: 1 });
+      }
+    } else if (Array.isArray(params.indices)) {
+      for (const idx of params.indices) {
+        if (idx >= 0 && idx < posAttr.count) {
+          affected.push({ index: idx, weight: 1 });
+        }
+      }
+    } else if (params.sphere) {
+      // Sphere selection with falloff
+      const cx = params.sphere.center[0],
+        cy = params.sphere.center[1],
+        cz = params.sphere.center[2];
+      const radius = params.sphere.radius;
+      for (let i = 0; i < posAttr.count; i++) {
+        const dx = posAttr.getX(i) - cx;
+        const dy = posAttr.getY(i) - cy;
+        const dz = posAttr.getZ(i) - cz;
+        const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (dist <= radius) {
+          let weight = 1 - dist / radius;
+          if (falloff === "smooth") weight = weight * weight * (3 - 2 * weight);
+          else if (falloff === "sharp") weight = weight * weight;
+          affected.push({ index: i, weight });
+        }
+      }
+    } else if (params.box) {
+      const bmin = params.box.min,
+        bmax = params.box.max;
+      for (let i = 0; i < posAttr.count; i++) {
+        const x = posAttr.getX(i),
+          y = posAttr.getY(i),
+          z = posAttr.getZ(i);
+        if (
+          x >= bmin[0] &&
+          x <= bmax[0] &&
+          y >= bmin[1] &&
+          y <= bmax[1] &&
+          z >= bmin[2] &&
+          z <= bmax[2]
+        ) {
+          affected.push({ index: i, weight: 1 });
+        }
+      }
+    }
+
+    // Apply displacement along normals
+    for (const { index, weight } of affected) {
+      const nx = normals.getX(index),
+        ny = normals.getY(index),
+        nz = normals.getZ(index);
+      const d = distance * weight;
+      posAttr.setXYZ(
+        index,
+        posAttr.getX(index) + nx * d,
+        posAttr.getY(index) + ny * d,
+        posAttr.getZ(index) + nz * d,
+      );
+    }
+    posAttr.needsUpdate = true;
+    ppGeometry.computeVertexNormals();
+    return { objectId: params.objectId, verticesAffected: affected.length };
   },
 
   removeObject(params) {
@@ -2207,6 +2801,95 @@ const asyncCommands: Record<string, AsyncCommandHandler> = {
         frames: frameRects,
       },
     };
+  },
+
+  async importModel(params) {
+    const { id, data, format, position, scale: scaleParam, mergeGeometry } = params;
+    const bytes = Uint8Array.from(atob(data), (c) => c.charCodeAt(0));
+
+    let resultObj: THREE.Object3D;
+
+    if (format === "glb" || format === "gltf") {
+      const loader = new GLTFLoader();
+      const blob = new Blob([bytes]);
+      const url = URL.createObjectURL(blob);
+      try {
+        const gltf = await loader.loadAsync(url);
+        resultObj = gltf.scene;
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    } else if (format === "obj") {
+      const loader = new OBJLoader();
+      const text = new TextDecoder().decode(bytes);
+      resultObj = loader.parse(text);
+    } else if (format === "stl") {
+      const loader = new STLLoader();
+      const stlGeometry = loader.parse(bytes.buffer);
+      stlGeometry.computeVertexNormals();
+      const stlMaterial = new THREE.MeshStandardMaterial({ color: 0xcccccc });
+      resultObj = new THREE.Mesh(stlGeometry, stlMaterial);
+    } else {
+      throw new Error(`Unsupported format: ${format}`);
+    }
+
+    resultObj.name = id;
+
+    if (position) {
+      resultObj.position.set(position[0], position[1], position[2]);
+    }
+    if (scaleParam) {
+      if (typeof scaleParam === "number") {
+        resultObj.scale.setScalar(scaleParam);
+      } else {
+        resultObj.scale.set(scaleParam[0], scaleParam[1], scaleParam[2]);
+      }
+    }
+
+    // Optionally merge all child geometries into one mesh
+    if (mergeGeometry && resultObj.children.length > 0) {
+      const geometries: THREE.BufferGeometry[] = [];
+      let firstMat: THREE.Material | null = null;
+      resultObj.traverse((child) => {
+        if (child instanceof THREE.Mesh) {
+          const geo = child.geometry.clone();
+          geo.applyMatrix4(child.matrixWorld);
+          geometries.push(geo);
+          if (!firstMat && child.material instanceof THREE.Material) {
+            firstMat = child.material.clone();
+          }
+        }
+      });
+      if (geometries.length > 0) {
+        const mergedGeo = mergeGeometries(geometries, false);
+        if (mergedGeo) {
+          const mergedMesh = new THREE.Mesh(
+            mergedGeo,
+            firstMat ?? new THREE.MeshStandardMaterial({ color: 0xcccccc }),
+          );
+          mergedMesh.name = id;
+          if (position) mergedMesh.position.set(position[0], position[1], position[2]);
+          if (scaleParam) {
+            if (typeof scaleParam === "number") mergedMesh.scale.setScalar(scaleParam);
+            else mergedMesh.scale.set(scaleParam[0], scaleParam[1], scaleParam[2]);
+          }
+          resultObj = mergedMesh;
+        }
+      }
+    }
+
+    scene.add(resultObj);
+    objects.set(id, resultObj);
+
+    // Count vertices
+    let vertexCount = 0;
+    resultObj.traverse((child) => {
+      if (child instanceof THREE.Mesh) {
+        vertexCount += child.geometry.getAttribute("position")?.count ?? 0;
+      }
+    });
+
+    return { id, format, vertexCount, childCount: resultObj.children.length };
   },
 };
 
